@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=77.0,<83"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "hermes-cli-bridge"
+version = "0.1.0"
+description = "Hermes gateway plugin that bridges Telegram/Discord/Slack chats to Codex and Claude CLI tmux sessions."
+readme = "README.md"
+requires-python = ">=3.11,<3.14"
+license = "MIT"
+authors = [{ name = "Hermes CLI Bridge maintainers" }]
+dependencies = ["hermes-agent>=0.17.0"]
+
+[project.entry-points."hermes_agent.plugins"]
+cli-bridge = "hermes_cli_bridge"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["hermes_cli_bridge*"]

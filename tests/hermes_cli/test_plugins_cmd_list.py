@@ -1,5 +1,6 @@
 import argparse
 import json
+from types import SimpleNamespace
 
 from hermes_cli import plugins_cmd
 
@@ -86,3 +87,86 @@ def test_cmd_list_json_output(monkeypatch, capsys):
             "source": "git",
         }
     ]
+
+
+def test_discover_all_plugins_includes_entrypoint_plugins(monkeypatch, tmp_path):
+    fake_ep = SimpleNamespace(
+        name="cli-bridge",
+        value="hermes_cli_bridge",
+        group="hermes_agent.plugins",
+        dist=SimpleNamespace(
+            version="0.1.0",
+            metadata={"Summary": "Chat to CLI bridge"},
+        ),
+    )
+
+    class FakeEntryPoints(list):
+        def select(self, *, group):
+            return [ep for ep in self if ep.group == group]
+
+    monkeypatch.setattr("hermes_cli.plugins.get_bundled_plugins_dir", lambda: tmp_path / "bundled")
+    monkeypatch.setattr(plugins_cmd, "_plugins_dir", lambda: tmp_path / "user")
+    monkeypatch.setattr(
+        plugins_cmd.importlib.metadata,
+        "entry_points",
+        lambda: FakeEntryPoints([fake_ep]),
+    )
+
+    entries = plugins_cmd._discover_all_plugins()
+
+    assert (
+        "cli-bridge",
+        "0.1.0",
+        "Chat to CLI bridge",
+        "entrypoint",
+        "hermes_cli_bridge",
+        "cli-bridge",
+    ) in entries
+    assert plugins_cmd._resolve_plugin_key("cli-bridge") == "cli-bridge"
+    assert plugins_cmd._resolve_plugin_key_and_source("cli-bridge") == (
+        "cli-bridge",
+        "entrypoint",
+    )
+
+
+def test_cmd_enable_entrypoint_plugin_writes_enabled_set(monkeypatch):
+    monkeypatch.setattr(
+        plugins_cmd,
+        "_discover_all_plugins",
+        lambda: [
+            (
+                "cli-bridge",
+                "0.1.0",
+                "Chat to CLI bridge",
+                "entrypoint",
+                "hermes_cli_bridge",
+                "cli-bridge",
+            )
+        ],
+    )
+    monkeypatch.setattr(plugins_cmd, "_get_enabled_set", lambda: set())
+    monkeypatch.setattr(plugins_cmd, "_get_disabled_set", lambda: set())
+    saved: dict[str, set] = {}
+    monkeypatch.setattr(
+        plugins_cmd,
+        "_save_enabled_set",
+        lambda enabled: saved.setdefault("enabled", set(enabled)),
+    )
+    monkeypatch.setattr(
+        plugins_cmd,
+        "_save_disabled_set",
+        lambda disabled: saved.setdefault("disabled", set(disabled)),
+    )
+    monkeypatch.setattr(
+        plugins_cmd,
+        "_set_plugin_entry_flag",
+        lambda plugin_id, key, value: saved.setdefault(
+            "entry_flag", {(plugin_id, key, value)}
+        ),
+    )
+
+    plugins_cmd.cmd_enable("cli-bridge", allow_tool_override=False)
+
+    assert saved["enabled"] == {"cli-bridge"}
+    assert saved["disabled"] == set()
+    assert saved["entry_flag"] == {("cli-bridge", "allow_tool_override", False)}

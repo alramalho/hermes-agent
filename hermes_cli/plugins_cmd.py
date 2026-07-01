@@ -10,6 +10,7 @@ rendered with Rich Markdown.  Otherwise a default confirmation is shown.
 from __future__ import annotations
 
 import functools
+import importlib.metadata
 import json
 import logging
 import os
@@ -1004,11 +1005,11 @@ def _scan_level(
 
 def _discover_all_plugins() -> list:
     """Return a list of (name, version, description, source, dir_path, key) for
-    every plugin the loader can see — user + bundled + project.
+    every plugin the loader can see — bundled + user + pip entry points.
 
     Matches the ordering/dedup of ``PluginManager.discover_and_load``:
-    bundled first, then user, then project; user overrides bundled on
-    key collision.
+    bundled first, then user, then entry points; later sources override
+    earlier ones on key collision.
     """
     seen: dict = {}  # key -> (name, version, description, source, path, key)
 
@@ -1020,6 +1021,41 @@ def _discover_all_plugins() -> list:
         (_plugins_dir(), "user", set()),
     ):
         _scan_level(base, source, skip, "", 0, seen)
+
+    try:
+        from hermes_cli.plugins import ENTRY_POINTS_GROUP
+
+        eps = importlib.metadata.entry_points()
+        if hasattr(eps, "select"):
+            group_eps = eps.select(group=ENTRY_POINTS_GROUP)
+        elif isinstance(eps, dict):
+            group_eps = eps.get(ENTRY_POINTS_GROUP, [])
+        else:
+            group_eps = [ep for ep in eps if ep.group == ENTRY_POINTS_GROUP]
+        for ep in group_eps:
+            version = ""
+            description = ""
+            dist = getattr(ep, "dist", None)
+            if dist is not None:
+                try:
+                    version = str(getattr(dist, "version", "") or "")
+                except Exception:
+                    version = ""
+                try:
+                    metadata = getattr(dist, "metadata", {}) or {}
+                    description = str(metadata.get("Summary", "") or "")
+                except Exception:
+                    description = ""
+            seen[ep.name] = (
+                ep.name,
+                version,
+                description,
+                "entrypoint",
+                getattr(ep, "value", ""),
+                ep.name,
+            )
+    except Exception as exc:
+        logger.debug("Entry-point plugin discovery failed: %s", exc)
     return list(seen.values())
 
 
