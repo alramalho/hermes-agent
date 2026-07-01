@@ -1,0 +1,18 @@
+name: terminal-relay
+version: 0.1.0
+description: Route Telegram/gateway messages into persistent tmux-backed Codex or Claude Code sessions
+provides_hooks:
+  - pre_gateway_dispatch
+provides_commands:
+  - relay_start
+  - relay_end
+  - relay_status
+  - relay_capture
+  - codex_init
+  - codex_end
+  - codex_status
+  - codex_capture
+  - claude_init
+  - claude_end
+  - claude_status
+  - claude_capture
