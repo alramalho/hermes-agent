@@ -14,6 +14,8 @@ Route messages from a Hermes gateway chat (Telegram, Discord, etc.) into a persi
 
 While a relay is active, normal non-slash messages in that same chat/topic are sent directly to the tmux session and Hermes does not run its normal agent loop. Unknown slash commands are not hijacked.
 
+Relay output is captured from the terminal screen because interactive Codex/Claude Code TUIs do not expose a structured "latest assistant reply" protocol. The plugin captures the pane before and after each sent message and returns only the changed lines; `/relay_capture` still shows the current pane tail when you need more context.
+
 ## Environment overrides
 
 - `HERMES_RELAY_DEFAULT_CWD` — default working directory; defaults to `$HOME`.

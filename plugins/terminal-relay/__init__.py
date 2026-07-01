@@ -203,12 +203,62 @@ def _capture(session: str, lines: int = DEFAULT_CAPTURE_LINES, max_chars: int = 
     return text
 
 
+def _capture_delta(before: str, after: str, max_chars: int = DEFAULT_MAX_REPLY_CHARS) -> str:
+    """Return the part of a tmux capture that changed after a prompt.
+
+    This is still terminal screen scraping (Codex/Claude do not provide a
+    structured "latest reply" protocol in interactive TUI mode), but trimming
+    common prefix/suffix avoids reposting the startup banner and old prompts on
+    every Telegram message.
+    """
+    if not after:
+        return ""
+    if not before:
+        delta = after
+    else:
+        before_lines = before.splitlines()
+        after_lines = after.splitlines()
+        prefix = 0
+        max_prefix = min(len(before_lines), len(after_lines))
+        while prefix < max_prefix and before_lines[prefix] == after_lines[prefix]:
+            prefix += 1
+
+        suffix = 0
+        max_suffix = min(len(before_lines) - prefix, len(after_lines) - prefix)
+        while (
+            suffix < max_suffix
+            and before_lines[len(before_lines) - 1 - suffix]
+            == after_lines[len(after_lines) - 1 - suffix]
+        ):
+            suffix += 1
+
+        changed = after_lines[prefix: len(after_lines) - suffix if suffix else len(after_lines)]
+        delta = "\n".join(changed).strip()
+        if not delta:
+            # TUI redraws can defeat line-level diffing. Prefer a short tail
+            # over an empty response so users still get actionable context.
+            delta = "\n".join(after_lines[-25:]).strip()
+
+    if len(delta) > max_chars:
+        delta = "…\n" + delta[-max_chars:]
+    return delta
+
+
 def _send_keys(session: str, text: str) -> tuple[bool, str]:
     if not _tmux_exists(session):
         return False, "tmux session is no longer running"
-    # send-keys with a single argument preserves spaces/newlines as literal key
-    # input in tmux. Then press Enter to submit to the TUI.
-    proc = _run(["tmux", "send-keys", "-t", session, "--", text, "Enter"], timeout=5)
+    # Put the exact user message in a tmux paste buffer, paste it into the TUI,
+    # then submit with C-m. This is more reliable than passing arbitrary text as
+    # tmux key names and avoids Enter/newline ambiguity in prompt_toolkit TUIs.
+    buffer_name = f"{PLUGIN_NAME}-{int(time.time() * 1000)}"
+    proc = _run(["tmux", "set-buffer", "-b", buffer_name, "--", text], timeout=5)
+    if proc.returncode != 0:
+        return False, (proc.stderr or proc.stdout or "tmux set-buffer failed").strip()
+    proc = _run(["tmux", "paste-buffer", "-b", buffer_name, "-t", session], timeout=5)
+    if proc.returncode != 0:
+        return False, (proc.stderr or proc.stdout or "tmux paste-buffer failed").strip()
+    proc = _run(["tmux", "send-keys", "-t", session, "C-m"], timeout=5)
+    _run(["tmux", "delete-buffer", "-b", buffer_name], timeout=2)
     if proc.returncode != 0:
         return False, (proc.stderr or proc.stdout or "tmux send-keys failed").strip()
     return True, "sent"
@@ -269,8 +319,8 @@ def _schedule_send(gateway: Any, event: Any, content: str) -> None:
             pass
 
 
-def _format_capture(session: str, prefix: str = "") -> str:
-    cap = _capture(session)
+def _format_capture(session: str, prefix: str = "", body: str | None = None) -> str:
+    cap = _capture(session) if body is None else body.strip()
     if not cap:
         return (prefix + "\n" if prefix else "") + "No captured output yet."
     header = (prefix + "\n\n" if prefix else "") + "```text\n"
@@ -409,6 +459,7 @@ def _relay_message(source: Any, text: str) -> str:
         _save_state(state)
         return "⚠️ Relay tmux session is gone; relay state was cleared. Normal Hermes chat is restored."
 
+    before = _capture(session)
     ok, msg = _send_keys(session, text)
     if not ok:
         return f"❌ Failed to send to tmux `{session}`: {msg}"
@@ -419,7 +470,13 @@ def _relay_message(source: Any, text: str) -> str:
 
     if DEFAULT_CAPTURE_DELAY > 0:
         time.sleep(min(DEFAULT_CAPTURE_DELAY, 5.0))
-    return _format_capture(session, prefix=f"↪️ Sent to `{entry.get('backend')}` (`{session}`).")
+    after = _capture(session)
+    delta = _capture_delta(before, after)
+    return _format_capture(
+        session,
+        prefix=f"↪️ Sent to `{entry.get('backend')}` (`{session}`). Showing changed output only.",
+        body=delta,
+    )
 
 
 def _pre_gateway_dispatch(event: Any = None, gateway: Any = None, **_: Any) -> dict[str, Any] | None:
