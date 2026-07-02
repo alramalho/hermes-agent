@@ -43,6 +43,8 @@ HERMES_CLI_BRIDGE_OUTPUT_INTERVAL=1.0
 HERMES_CLI_BRIDGE_CHUNK_CHARS=3500
 HERMES_CLI_BRIDGE_MAX_OUTPUT_CHARS=12000
 HERMES_CLI_BRIDGE_EXEC_TIMEOUT=1800
+HERMES_CLI_BRIDGE_TRANSCRIBE_VOICE=1
+HERMES_CLI_BRIDGE_TRANSCRIBE_TIMEOUT=120
 HERMES_CLI_BRIDGE_OUTPUT_SOURCE=capture
 HERMES_CLI_BRIDGE_RAW_LOG=0
 HERMES_CLI_BRIDGE_LOG_SNIPPET_CHARS=50
@@ -65,6 +67,10 @@ reliable for chat bridges because it does not depend on terminal keybindings to
 submit the composer. `HERMES_CLI_BRIDGE_CODEX_CMD` is reused for model/config
 flags; TUI-only flags such as `--no-alt-screen` are ignored for exec calls. Set
 `HERMES_CLI_BRIDGE_CODEX_EXEC_CMD` if you want to provide the exact exec command.
+
+For exec-backed Codex sessions, Telegram voice messages are transcribed through
+Hermes's normal STT pipeline before the prompt is sent to Codex. Uploaded audio
+files remain attachment path notes so Codex can decide how to process them.
 
 Gateway INFO logs include redacted `input='first 50 chars...'` and
 `output='first 50 chars...'` snippets. The JSONL audit log keeps capped, redacted

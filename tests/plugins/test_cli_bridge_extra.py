@@ -9,7 +9,7 @@ from types import SimpleNamespace
 import pytest
 
 from gateway.config import Platform
-from gateway.platforms.base import MessageEvent
+from gateway.platforms.base import MessageEvent, MessageType
 from gateway.session import SessionSource
 from hermes_cli.plugins import PluginContext, PluginManager, PluginManifest
 
@@ -406,6 +406,95 @@ def test_codex_exec_backend_routes_subprocess_output(
     assert "[codex]\nBRIDGE_OK" in replies
     session = next(iter(plugin._sessions.values()))
     assert session.thread_id == "thread-1"
+
+
+def test_codex_exec_backend_transcribes_voice_before_prompt(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    fake_tmux = FakeTmux()
+    replies: list[str] = []
+    received_inputs: list[str] = []
+
+    def _runner(args, **kwargs):
+        received_inputs.append(kwargs["input"])
+        output_path = Path(args[args.index("--output-last-message") + 1])
+        output_path.write_text("VOICE_OK", encoding="utf-8")
+        stdout = '{"type":"thread.started","thread_id":"thread-voice"}\n'
+        return subprocess.CompletedProcess(args=args, returncode=0, stdout=stdout, stderr="")
+
+    class Gateway:
+        adapters = {}
+
+        def _is_user_authorized(self, _source) -> bool:
+            return True
+
+        async def _enrich_message_with_transcription(self, text, audio_paths):
+            assert text == "caption"
+            assert audio_paths == ["/tmp/hermes-voice.ogg"]
+            return '"hello from voice"\n\ncaption', ["hello from voice"]
+
+    plugin = _plugin(fake_tmux, replies, tmp_path, exec_runner=_runner)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("HERMES_CLI_BRIDGE_CODEX_BACKEND", "exec")
+    plugin.handle_pre_gateway_dispatch(event=_event("/codex init"), gateway=Gateway())
+    event = _event("caption")
+    event.message_type = MessageType.VOICE
+    event.media_urls = ["/tmp/hermes-voice.ogg"]
+    event.media_types = ["audio/ogg"]
+
+    result = plugin.handle_pre_gateway_dispatch(event=event, gateway=Gateway())
+
+    deadline = time.time() + 1
+    while time.time() < deadline and not received_inputs:
+        time.sleep(0.01)
+
+    assert result == {"action": "skip", "reason": "cli-bridge-input"}
+    assert received_inputs == ['"hello from voice"\n\ncaption']
+    assert "[codex]\nVOICE_OK" in replies
+
+
+def test_codex_exec_backend_keeps_uploaded_audio_as_attachment(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    fake_tmux = FakeTmux()
+    replies: list[str] = []
+    received_inputs: list[str] = []
+
+    def _runner(args, **kwargs):
+        received_inputs.append(kwargs["input"])
+        output_path = Path(args[args.index("--output-last-message") + 1])
+        output_path.write_text("AUDIO_OK", encoding="utf-8")
+        return subprocess.CompletedProcess(args=args, returncode=0, stdout="", stderr="")
+
+    class Gateway:
+        adapters = {}
+
+        def _is_user_authorized(self, _source) -> bool:
+            return True
+
+        async def _enrich_message_with_transcription(self, _text, _audio_paths):
+            raise AssertionError("uploaded audio files should not be auto-transcribed")
+
+    plugin = _plugin(fake_tmux, replies, tmp_path, exec_runner=_runner)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("HERMES_CLI_BRIDGE_CODEX_BACKEND", "exec")
+    plugin.handle_pre_gateway_dispatch(event=_event("/codex init"), gateway=Gateway())
+    event = _event("")
+    event.message_type = MessageType.AUDIO
+    event.media_urls = ["/tmp/song.mp3"]
+    event.media_types = ["audio/mpeg"]
+
+    result = plugin.handle_pre_gateway_dispatch(event=event, gateway=Gateway())
+
+    deadline = time.time() + 1
+    while time.time() < deadline and not received_inputs:
+        time.sleep(0.01)
+
+    assert result == {"action": "skip", "reason": "cli-bridge-input"}
+    assert received_inputs == ["User attached file(s):\n- audio/mpeg: /tmp/song.mp3"]
+    assert "[codex]\nAUDIO_OK" in replies
 
 
 def test_codex_exec_command_derives_from_tui_command(tmp_path: Path, monkeypatch) -> None:

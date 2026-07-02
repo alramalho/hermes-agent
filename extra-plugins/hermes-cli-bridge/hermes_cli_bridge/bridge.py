@@ -240,6 +240,14 @@ class CliBridgePlugin:
         self.chunk_chars = _env_int("HERMES_CLI_BRIDGE_CHUNK_CHARS", 3500)
         self.max_output_chars = _env_int("HERMES_CLI_BRIDGE_MAX_OUTPUT_CHARS", 12000)
         self.exec_timeout = _env_float("HERMES_CLI_BRIDGE_EXEC_TIMEOUT", 1800.0)
+        self.voice_transcription_enabled = _env_bool(
+            "HERMES_CLI_BRIDGE_TRANSCRIBE_VOICE",
+            True,
+        )
+        self.voice_transcription_timeout = _env_float(
+            "HERMES_CLI_BRIDGE_TRANSCRIBE_TIMEOUT",
+            120.0,
+        )
         self.log_snippet_chars = _env_int("HERMES_CLI_BRIDGE_LOG_SNIPPET_CHARS", 50)
         output_source = os.environ.get("HERMES_CLI_BRIDGE_OUTPUT_SOURCE", "capture")
         self.output_source = output_source.strip().lower() or "capture"
@@ -641,15 +649,29 @@ class CliBridgePlugin:
         if isinstance(text, str) and text.strip():
             parts.append(text.strip())
 
+        media_note = self._media_payload(event)
+        if media_note:
+            parts.append(media_note)
+        return "\n\n".join(parts).strip()
+
+    def _media_payload(
+        self,
+        event: Any,
+        *,
+        skip_paths: set[str] | None = None,
+    ) -> str:
         media_urls = list(getattr(event, "media_urls", []) or [])
         media_types = list(getattr(event, "media_types", []) or [])
-        if media_urls:
-            attachment_lines = []
-            for idx, path in enumerate(media_urls):
-                media_type = media_types[idx] if idx < len(media_types) else "file"
-                attachment_lines.append(f"- {media_type}: {path}")
-            parts.append("User attached file(s):\n" + "\n".join(attachment_lines))
-        return "\n\n".join(parts).strip()
+        skip_paths = skip_paths or set()
+        attachment_lines = []
+        for idx, path in enumerate(media_urls):
+            if str(path) in skip_paths:
+                continue
+            media_type = media_types[idx] if idx < len(media_types) else "file"
+            attachment_lines.append(f"- {media_type}: {path}")
+        if not attachment_lines:
+            return ""
+        return "User attached file(s):\n" + "\n".join(attachment_lines)
 
     def _authorized(self, gateway: Any, event: Any) -> bool:
         checker = getattr(gateway, "_is_user_authorized", None)
@@ -686,6 +708,128 @@ class CliBridgePlugin:
         worker.start()
         return True
 
+    def _prepare_exec_payload(
+        self,
+        session: BridgeSession,
+        payload: str,
+        gateway: Any,
+        event: Any,
+    ) -> str:
+        voice_paths = self._voice_audio_paths(event)
+        if not self.voice_transcription_enabled or not voice_paths:
+            return payload
+
+        text = getattr(event, "text", "") or ""
+        text = text.strip() if isinstance(text, str) else ""
+        try:
+            enriched_text, transcripts = self._transcribe_voice_paths(
+                gateway,
+                text,
+                voice_paths,
+            )
+        except Exception as exc:
+            logger.warning(
+                "cli-bridge voice transcription failed: agent=%s session=%s "
+                "audio=%d error=%s",
+                session.agent,
+                session.session_name,
+                len(voice_paths),
+                exc,
+            )
+            self._audit(
+                "voice_transcription_failed",
+                session,
+                event,
+                audio=len(voice_paths),
+                error=str(exc),
+            )
+            return payload
+
+        remaining_media = self._media_payload(event, skip_paths=set(voice_paths))
+        parts = []
+        if enriched_text.strip():
+            parts.append(enriched_text.strip())
+        if remaining_media:
+            parts.append(remaining_media)
+        prepared = "\n\n".join(parts).strip() or payload
+        logger.info(
+            "cli-bridge voice transcription prepared: agent=%s session=%s "
+            "audio=%d transcripts=%d input=%r",
+            session.agent,
+            session.session_name,
+            len(voice_paths),
+            len(transcripts),
+            self._log_snippet(prepared),
+        )
+        self._audit(
+            "voice_transcription_prepared",
+            session,
+            event,
+            audio=len(voice_paths),
+            transcripts=len(transcripts),
+            input=self._audit_snippet(prepared),
+        )
+        return prepared
+
+    def _voice_audio_paths(self, event: Any) -> list[str]:
+        message_type = self._event_message_type(event)
+        paths: list[str] = []
+        media_urls = list(getattr(event, "media_urls", []) or [])
+        media_types = list(getattr(event, "media_types", []) or [])
+        for idx, path in enumerate(media_urls):
+            media_type = media_types[idx] if idx < len(media_types) else ""
+            if message_type == "voice" or (
+                str(media_type).lower().startswith("audio/")
+                and message_type not in {"audio", "document"}
+            ):
+                paths.append(str(path))
+        return paths
+
+    def _event_message_type(self, event: Any) -> str:
+        message_type = getattr(event, "message_type", None)
+        return str(getattr(message_type, "value", message_type) or "").lower()
+
+    def _transcribe_voice_paths(
+        self,
+        gateway: Any,
+        text: str,
+        voice_paths: list[str],
+    ) -> tuple[str, list[str]]:
+        transcriber = getattr(gateway, "_enrich_message_with_transcription", None)
+        if callable(transcriber):
+            result = transcriber(text, voice_paths)
+            if inspect.isawaitable(result):
+                return self._run_awaitable(
+                    gateway,
+                    result,
+                    timeout=self.voice_transcription_timeout,
+                )
+            return result
+
+        from tools.transcription_tools import transcribe_audio
+
+        enriched_parts: list[str] = []
+        transcripts: list[str] = []
+        for path in voice_paths:
+            result = transcribe_audio(path)
+            if result.get("success"):
+                transcript = str(result.get("transcript") or "")
+                transcripts.append(transcript)
+                enriched_parts.append(f'"{transcript}"')
+            else:
+                enriched_parts.append("[voice message could not be transcribed]")
+
+        prefix = "\n\n".join(part for part in enriched_parts if part).strip()
+        if prefix and text:
+            return f"{prefix}\n\n{text}", transcripts
+        return prefix or text, transcripts
+
+    def _run_awaitable(self, gateway: Any, awaitable: Any, *, timeout: float) -> Any:
+        loop = getattr(gateway, "_gateway_loop", None)
+        if loop is not None and loop.is_running():
+            return asyncio.run_coroutine_threadsafe(awaitable, loop).result(timeout=timeout)
+        return asyncio.run(awaitable)
+
     def _exec_prompt_worker(
         self,
         session: BridgeSession,
@@ -696,6 +840,7 @@ class CliBridgePlugin:
         started = time.perf_counter()
         output_path = self.state_dir / f"{session.session_name}-last.txt"
         try:
+            payload = self._prepare_exec_payload(session, payload, gateway, event)
             output_path.parent.mkdir(parents=True, exist_ok=True)
             output_path.unlink(missing_ok=True)
             command = self._codex_exec_command(session, output_path)
