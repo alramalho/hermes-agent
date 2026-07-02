@@ -292,7 +292,7 @@ class CliBridgePlugin:
                 agent,
                 handler=lambda raw_args, _agent=agent: self._command_stub(_agent, raw_args),
                 description=f"Control a tmux-backed {agent.title()} CLI bridge.",
-                args_hint="init|list|select|send|status|kill",
+                args_hint="init|list|select|rename|send|status|kill",
             )
 
     def _command_stub(self, agent: str, raw_args: str) -> str:
@@ -425,6 +425,10 @@ class CliBridgePlugin:
         if subcommand == "select":
             target = argv[1] if len(argv) > 1 else None
             return self._select_session(agent, target, event)
+        if subcommand == "rename":
+            if len(argv) != 2:
+                return f"[{agent}] usage: /{agent} rename <new-name>"
+            return self._rename_session(agent, event, argv[1])
         if subcommand == "send":
             payload = raw_args.strip().partition(" ")[2]
             return self._send_control(agent, payload, event, gateway)
@@ -677,6 +681,51 @@ class CliBridgePlugin:
                 return f"[{agent}] no session named {name!r}.\n\n{self._list_sessions(agent, event)}"
             self._selected_sessions[base_key] = name
         return f"[{agent}] selected {name}."
+
+    def _rename_session(self, agent: str, event: Any, new_name_raw: str) -> str:
+        try:
+            new_name = self._normalize_bridge_name(new_name_raw)
+        except ValueError as exc:
+            return f"[{agent}] {exc}"
+        source = getattr(event, "source", None)
+        with self._lock:
+            session = self._session_for_event_locked(
+                event,
+                agent=agent,
+                require_live=True,
+                target="current",
+            )
+            if session is None:
+                return self._list_sessions(agent, event)
+            old_name = session.name
+            if old_name == new_name:
+                return f"[{agent}:{new_name}] already named {new_name}."
+
+            new_key = self._session_key(agent, source, new_name)
+            existing = self._sessions.get(new_key)
+            existing = self._live_or_drop_locked(existing) if existing is not None else None
+            if existing is not None and existing is not session:
+                return f"[{agent}] session named {new_name!r} already exists."
+
+            self._sessions.pop(session.key, None)
+            session.key = new_key
+            session.name = new_name
+            self._sessions[new_key] = session
+            self._selected_sessions[session.base_key] = new_name
+
+        fields = _event_log_fields(event)
+        logger.info(
+            "cli-bridge session renamed: agent=%s old_bridge=%s new_bridge=%s platform=%s chat=%s user=%s session=%s",
+            agent,
+            old_name,
+            new_name,
+            fields["platform"],
+            fields["chat"],
+            fields["user"],
+            session.session_name,
+        )
+        self._audit("session_renamed", session, event, old_name=old_name, new_name=new_name)
+        return f"[{agent}:{new_name}] renamed {old_name} -> {new_name}."
 
     def _status(self, agent: str, event: Any, *, target: str | None = None) -> str:
         session = self._session_for_event(
@@ -2046,6 +2095,7 @@ class CliBridgePlugin:
             f"/{agent} init [name] [--cwd <cwd>] - start or attach a named session\n"
             f"/{agent} list - show this chat's sessions\n"
             f"/{agent} select <name|none> - choose the current session\n"
+            f"/{agent} rename <new-name> - rename the current bridge session\n"
             f"/{agent} send <text> - send exact text, including slash commands\n"
             f"/{agent} status [name|current] - show bridge status\n"
             f"/{agent} kill [name|current] - kill a session\n\n"

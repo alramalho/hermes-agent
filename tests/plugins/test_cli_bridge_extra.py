@@ -258,6 +258,61 @@ def test_named_sessions_can_be_killed_by_name_or_current(
     assert replies[-1] == f"[codex:web] killed tmux session {web_session}."
 
 
+def test_named_session_can_be_renamed_without_restarting_tmux(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    fake_tmux = FakeTmux()
+    replies: list[str] = []
+    plugin = _plugin(fake_tmux, replies, tmp_path)
+    monkeypatch.chdir(tmp_path)
+
+    plugin.handle_pre_gateway_dispatch(event=_event("/codex init api"), gateway=_gateway())
+    session_name = str(fake_tmux.started[-1]["session_name"])
+
+    plugin.handle_pre_gateway_dispatch(
+        event=_event("/codex rename backend"),
+        gateway=_gateway(),
+    )
+
+    assert len(fake_tmux.started) == 1
+    assert replies[-1] == "[codex:backend] renamed api -> backend."
+
+    plugin.handle_pre_gateway_dispatch(event=_event("/codex list"), gateway=_gateway())
+    assert "* backend (tmux)" in replies[-1]
+    assert " api (tmux)" not in replies[-1]
+
+    plugin.handle_pre_gateway_dispatch(event=_event("hello backend"), gateway=_gateway())
+    assert fake_tmux.inputs[-1] == (session_name, "hello backend")
+
+    plugin.handle_pre_gateway_dispatch(
+        event=_event("/codex kill backend"),
+        gateway=_gateway(),
+    )
+    assert fake_tmux.stopped[-1] == session_name
+
+
+def test_named_session_rename_rejects_live_name_collision(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    fake_tmux = FakeTmux()
+    replies: list[str] = []
+    plugin = _plugin(fake_tmux, replies, tmp_path)
+    monkeypatch.chdir(tmp_path)
+
+    plugin.handle_pre_gateway_dispatch(event=_event("/codex init api"), gateway=_gateway())
+    api_session = str(fake_tmux.started[-1]["session_name"])
+    plugin.handle_pre_gateway_dispatch(event=_event("/codex init web"), gateway=_gateway())
+
+    plugin.handle_pre_gateway_dispatch(event=_event("/codex select api"), gateway=_gateway())
+    plugin.handle_pre_gateway_dispatch(event=_event("/codex rename web"), gateway=_gateway())
+
+    assert replies[-1] == "[codex] session named 'web' already exists."
+    plugin.handle_pre_gateway_dispatch(event=_event("still api"), gateway=_gateway())
+    assert fake_tmux.inputs[-1] == (api_session, "still api")
+
+
 def test_active_bridge_routes_plain_message_to_tmux(tmp_path: Path, monkeypatch) -> None:
     fake_tmux = FakeTmux()
     replies: list[str] = []
