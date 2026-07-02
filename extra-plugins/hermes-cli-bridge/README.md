@@ -45,6 +45,9 @@ HERMES_CLI_BRIDGE_MAX_OUTPUT_CHARS=12000
 HERMES_CLI_BRIDGE_EXEC_TIMEOUT=1800
 HERMES_CLI_BRIDGE_TRANSCRIBE_VOICE=1
 HERMES_CLI_BRIDGE_TRANSCRIBE_TIMEOUT=120
+HERMES_CLI_BRIDGE_TMUX_SUBMIT_KEYS=Escape,Enter
+HERMES_CLI_BRIDGE_CODEX_SUBMIT_KEYS=Escape,Enter
+HERMES_CLI_BRIDGE_TMUX_KEY_DELAY=0.15
 HERMES_CLI_BRIDGE_OUTPUT_SOURCE=capture
 HERMES_CLI_BRIDGE_RAW_LOG=0
 HERMES_CLI_BRIDGE_LOG_SNIPPET_CHARS=50
@@ -60,6 +63,18 @@ HERMES_CLI_BRIDGE_CODEX_CMD=codex --model gpt-5.5 --no-alt-screen -c check_for_u
 ```
 
 `HERMES_CLI_BRIDGE_OUTPUT_SOURCE=capture` reads the rendered tmux pane, which avoids most TUI redraw noise. Set it to `pipe` only when you explicitly want raw appended terminal output.
+
+Codex tmux submission defaults to `Escape,Enter`. That normalizes the composer
+state before submitting and works across Codex terminal modes that otherwise
+treat a lone `Enter` or `C-m` as an inserted newline. Override with
+`HERMES_CLI_BRIDGE_CODEX_SUBMIT_KEYS` or the generic
+`HERMES_CLI_BRIDGE_TMUX_SUBMIT_KEYS` when a target CLI needs different keys.
+`HERMES_CLI_BRIDGE_TMUX_KEY_DELAY` adds a small pause between keys so terminal
+UIs can process mode changes such as `Escape` before the submit key arrives.
+
+When the Codex tmux UI asks for permission, the bridge reuses Hermes' existing
+Telegram approval buttons. `Allow Once` sends `y`, `Session` and `Always` send
+`a`, and `Deny` sends `Escape` back to the tmux pane.
 
 Set `HERMES_CLI_BRIDGE_CODEX_BACKEND=exec` to route Codex prompts through
 `codex exec` / `codex exec resume` instead of the interactive TUI. This is more

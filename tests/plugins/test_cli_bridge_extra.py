@@ -26,6 +26,8 @@ class FakeTmux:
         self.sessions: set[str] = set()
         self.started: list[dict[str, object]] = []
         self.inputs: list[tuple[str, str]] = []
+        self.submit_keys: list[tuple[str, list[str]]] = []
+        self.keys: list[tuple[str, list[str]]] = []
         self.stopped: list[str] = []
 
     def start(self, **kwargs) -> None:
@@ -36,8 +38,18 @@ class FakeTmux:
     def has_session(self, session_name: str) -> bool:
         return session_name in self.sessions
 
-    def send_input(self, session_name: str, text: str) -> None:
+    def send_input(
+        self,
+        session_name: str,
+        text: str,
+        *,
+        submit_keys: list[str] | None = None,
+    ) -> None:
         self.inputs.append((session_name, text))
+        self.submit_keys.append((session_name, list(submit_keys or [])))
+
+    def send_keys(self, session_name: str, keys: list[str]) -> None:
+        self.keys.append((session_name, list(keys)))
 
     def stop(self, session_name: str) -> None:
         self.sessions.discard(session_name)
@@ -163,6 +175,7 @@ def test_active_bridge_routes_plain_message_to_tmux(tmp_path: Path, monkeypatch)
 
     assert result == {"action": "skip", "reason": "cli-bridge-input"}
     assert fake_tmux.inputs == [(session_name, "fix the tests")]
+    assert fake_tmux.submit_keys == [(session_name, ["Escape", "Enter"])]
 
 
 def test_active_bridge_routes_media_only_message_to_tmux(tmp_path: Path, monkeypatch) -> None:
@@ -312,6 +325,7 @@ def test_send_subcommand_can_forward_cli_slash_command(tmp_path: Path, monkeypat
 
     assert result == {"action": "skip", "reason": "cli-bridge-control"}
     assert fake_tmux.inputs[-1] == (session_name, "/compact")
+    assert fake_tmux.submit_keys[-1] == (session_name, ["Escape", "Enter"])
     assert replies[-1] == "[codex] sent."
 
 
@@ -331,6 +345,34 @@ def test_claude_init_starts_tmux_with_claude_command(tmp_path: Path, monkeypatch
     assert fake_tmux.started[0]["cwd"] == tmp_path
     assert fake_tmux.started[0]["command"] == "claude"
     assert replies[-1].startswith("[claude] started in")
+
+
+def test_claude_tmux_uses_plain_enter_submit(tmp_path: Path, monkeypatch) -> None:
+    fake_tmux = FakeTmux()
+    replies: list[str] = []
+    plugin = _plugin(fake_tmux, replies, tmp_path)
+    monkeypatch.chdir(tmp_path)
+    plugin.handle_pre_gateway_dispatch(event=_event("/claude init"), gateway=_gateway())
+    session_name = str(fake_tmux.started[0]["session_name"])
+
+    plugin.handle_pre_gateway_dispatch(event=_event("hello"), gateway=_gateway())
+
+    assert fake_tmux.inputs[-1] == (session_name, "hello")
+    assert fake_tmux.submit_keys[-1] == (session_name, ["Enter"])
+
+
+def test_codex_submit_keys_can_be_overridden(tmp_path: Path, monkeypatch) -> None:
+    fake_tmux = FakeTmux()
+    replies: list[str] = []
+    plugin = _plugin(fake_tmux, replies, tmp_path)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("HERMES_CLI_BRIDGE_CODEX_SUBMIT_KEYS", "C-m")
+    plugin.handle_pre_gateway_dispatch(event=_event("/codex init"), gateway=_gateway())
+    session_name = str(fake_tmux.started[0]["session_name"])
+
+    plugin.handle_pre_gateway_dispatch(event=_event("hello"), gateway=_gateway())
+
+    assert fake_tmux.submit_keys[-1] == (session_name, ["C-m"])
 
 
 def test_codex_init_uses_configured_command(tmp_path: Path, monkeypatch) -> None:
@@ -554,6 +596,101 @@ def test_parse_codex_exec_stdout(tmp_path: Path) -> None:
     assert message == "done"
 
 
+def test_codex_tmux_detects_edit_approval_prompt(tmp_path: Path) -> None:
+    plugin = CliBridgePlugin(enable_output_reader=False, state_dir=tmp_path)
+    session = SimpleNamespace(agent="codex")
+
+    approval = plugin._codex_approval_from_capture(
+        session,
+        """
+• Added hermes-permission-e2e.txt (+1 -0)
+    1 +ok
+
+  Would you like to make the following edits?
+
+› 1. Yes, proceed (y)
+  2. Yes, and don't ask again for these files (a)
+  3. No, and tell Codex what to do differently (esc)
+
+  Press enter to confirm or esc to cancel
+""",
+    )
+
+    assert approval is not None
+    assert "Would you like to make the following edits?" in approval["preview"]
+    assert approval["signature"]
+
+
+def test_codex_tmux_approval_uses_existing_gateway_buttons(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    class Adapter:
+        typed_command_prefix = "/"
+
+        def __init__(self) -> None:
+            self.requests: list[dict[str, object]] = []
+
+        def send_exec_approval(self, **kwargs):
+            self.requests.append(kwargs)
+            return SimpleNamespace(success=True)
+
+    def _await_gateway_decision(session_key, notify_cb, approval_data, *, surface):
+        notify_cb(approval_data)
+        assert session_key == "telegram:chat1:u1"
+        assert surface == "cli_bridge_tmux"
+        return {"resolved": True, "choice": "once"}
+
+    import tools.approval as approval_mod
+
+    monkeypatch.setattr(approval_mod, "_await_gateway_decision", _await_gateway_decision)
+    adapter = Adapter()
+    gateway = SimpleNamespace(
+        adapters={Platform.TELEGRAM: adapter},
+        _session_key_for_source=lambda _source: "telegram:chat1:u1",
+    )
+    plugin = CliBridgePlugin(enable_output_reader=False, state_dir=tmp_path)
+    session = SimpleNamespace(
+        key="fallback-key",
+        cwd=tmp_path,
+        session_name="hermes-codex-test",
+    )
+
+    choice = plugin._request_tmux_approval_decision(
+        session,
+        gateway,
+        _event(""),
+        "Would you like to make the following edits?",
+    )
+
+    assert choice == "once"
+    assert adapter.requests[0]["chat_id"] == "chat1"
+    assert adapter.requests[0]["session_key"] == "telegram:chat1:u1"
+    assert "Would you like to make the following edits?" in adapter.requests[0]["command"]
+
+
+def test_codex_tmux_approval_choice_maps_to_tmux_keys(tmp_path: Path) -> None:
+    fake_tmux = FakeTmux()
+    plugin = CliBridgePlugin(
+        tmux=fake_tmux,  # type: ignore[arg-type]
+        enable_output_reader=False,
+        state_dir=tmp_path,
+    )
+    session = SimpleNamespace(session_name="hermes-codex-test")
+
+    plugin._send_tmux_approval_choice(session, "once")
+    plugin._send_tmux_approval_choice(session, "session")
+    plugin._send_tmux_approval_choice(session, "always")
+    plugin._send_tmux_approval_choice(session, "deny")
+
+    assert fake_tmux.keys == [
+        ("hermes-codex-test", ["y"]),
+        ("hermes-codex-test", ["a"]),
+        ("hermes-codex-test", ["a"]),
+        ("hermes-codex-test", ["Escape"]),
+    ]
+
+
 def test_end_stops_session(tmp_path: Path, monkeypatch) -> None:
     fake_tmux = FakeTmux()
     replies: list[str] = []
@@ -618,7 +755,7 @@ def test_tmux_start_can_pipe_raw_log_file(tmp_path: Path, monkeypatch) -> None:
     assert calls[1][:4] == ["tmux", "pipe-pane", "-o", "-t"]
 
 
-def test_tmux_send_input_submits_with_control_m() -> None:
+def test_tmux_send_input_submits_with_configured_keys() -> None:
     calls: list[list[str]] = []
 
     def _runner(args, **_kwargs):
@@ -627,11 +764,12 @@ def test_tmux_send_input_submits_with_control_m() -> None:
 
     client = TmuxClient(runner=_runner)
 
-    client.send_input("hermes-codex-test", "hey")
+    client.send_input("hermes-codex-test", "hey", submit_keys=["Escape", "Enter"])
 
     assert calls == [
         ["tmux", "send-keys", "-t", "hermes-codex-test", "-l", "hey"],
-        ["tmux", "send-keys", "-t", "hermes-codex-test", "C-m"],
+        ["tmux", "send-keys", "-t", "hermes-codex-test", "Escape"],
+        ["tmux", "send-keys", "-t", "hermes-codex-test", "Enter"],
     ]
 
 
@@ -644,7 +782,11 @@ def test_tmux_send_input_pastes_multiline_payload_once() -> None:
 
     client = TmuxClient(runner=_runner)
 
-    client.send_input("hermes-codex-test", "look\n- image/jpeg: /tmp/a.jpg")
+    client.send_input(
+        "hermes-codex-test",
+        "look\n- image/jpeg: /tmp/a.jpg",
+        submit_keys=["Escape", "Enter"],
+    )
 
     assert calls == [
         (
@@ -655,7 +797,8 @@ def test_tmux_send_input_pastes_multiline_payload_once() -> None:
             ["tmux", "paste-buffer", "-d", "-b", "hermes-codex-test-input", "-t", "hermes-codex-test"],
             None,
         ),
-        (["tmux", "send-keys", "-t", "hermes-codex-test", "C-m"], None),
+        (["tmux", "send-keys", "-t", "hermes-codex-test", "Escape"], None),
+        (["tmux", "send-keys", "-t", "hermes-codex-test", "Enter"], None),
     ]
 
 

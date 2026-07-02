@@ -97,6 +97,7 @@ class BridgeSession:
     reader: threading.Thread | None = None
     created_at: float = field(default_factory=time.time)
     last_activity: float = field(default_factory=time.time)
+    approval_signature: str | None = None
 
 
 class TmuxClient:
@@ -104,6 +105,7 @@ class TmuxClient:
 
     def __init__(self, runner: Callable[..., subprocess.CompletedProcess[str]] | None = None):
         self._runner = runner or subprocess.run
+        self._key_delay = _env_float("HERMES_CLI_BRIDGE_TMUX_KEY_DELAY", 0.15)
 
     def ensure_available(self) -> None:
         if shutil.which("tmux") is None:
@@ -189,7 +191,13 @@ class TmuxClient:
         )
         return result.returncode == 0
 
-    def send_input(self, session_name: str, text: str) -> None:
+    def send_input(
+        self,
+        session_name: str,
+        text: str,
+        *,
+        submit_keys: list[str] | None = None,
+    ) -> None:
         if "\n" in text:
             buffer_name = _safe_name(f"{session_name}-input")[:64]
             self._run(
@@ -199,12 +207,18 @@ class TmuxClient:
             self._run(
                 ["tmux", "paste-buffer", "-d", "-b", buffer_name, "-t", session_name]
             )
-            self._run(["tmux", "send-keys", "-t", session_name, "C-m"])
+            self.send_keys(session_name, submit_keys or ["Enter"])
             return
 
         if text:
             self._run(["tmux", "send-keys", "-t", session_name, "-l", text])
-        self._run(["tmux", "send-keys", "-t", session_name, "C-m"])
+        self.send_keys(session_name, submit_keys or ["Enter"])
+
+    def send_keys(self, session_name: str, keys: list[str]) -> None:
+        for idx, key in enumerate(keys):
+            if idx and self._key_delay > 0:
+                time.sleep(self._key_delay)
+            self._run(["tmux", "send-keys", "-t", session_name, key])
 
     def stop(self, session_name: str) -> None:
         self._run(["tmux", "kill-session", "-t", session_name], check=False)
@@ -324,7 +338,11 @@ class CliBridgePlugin:
             if session.backend == "exec":
                 routed = self._route_exec_input(session, payload, gateway, event)
             else:
-                self.tmux.send_input(session.session_name, payload)
+                self.tmux.send_input(
+                    session.session_name,
+                    payload,
+                    submit_keys=self._tmux_submit_keys(session.agent),
+                )
                 routed = True
             session.last_activity = time.time()
             self._send_typing(gateway, event)
@@ -498,7 +516,11 @@ class CliBridgePlugin:
         if session.backend == "exec":
             routed = self._route_exec_input(session, payload, gateway, event)
         else:
-            self.tmux.send_input(session.session_name, payload)
+            self.tmux.send_input(
+                session.session_name,
+                payload,
+                submit_keys=self._tmux_submit_keys(session.agent),
+            )
             routed = True
         session.last_activity = time.time()
         self._send_typing(gateway, event)
@@ -642,6 +664,15 @@ class CliBridgePlugin:
             logger.warning("cli-bridge exec backend is only implemented for codex; using tmux")
             return "tmux"
         return backend
+
+    def _tmux_submit_keys(self, agent: str) -> list[str]:
+        raw = (
+            os.environ.get(f"HERMES_CLI_BRIDGE_{agent.upper()}_SUBMIT_KEYS")
+            or os.environ.get("HERMES_CLI_BRIDGE_TMUX_SUBMIT_KEYS")
+            or ("Escape,Enter" if agent == "codex" else "Enter")
+        )
+        keys = [part.strip() for part in raw.replace(" ", ",").split(",") if part.strip()]
+        return keys or (["Escape", "Enter"] if agent == "codex" else ["Enter"])
 
     def _event_payload(self, event: Any) -> str:
         parts: list[str] = []
@@ -1160,6 +1191,18 @@ class CliBridgePlugin:
                     break
                 snapshot = self._clean_output(self.tmux.capture(session.session_name))
                 now = time.monotonic()
+                approval = self._codex_approval_from_capture(session, snapshot)
+                if approval is not None:
+                    signature = str(approval["signature"])
+                    if signature != session.approval_signature:
+                        session.approval_signature = signature
+                        self._handle_tmux_approval(session, gateway, event, approval)
+                        last_snapshot = snapshot
+                        last_flush = time.monotonic()
+                    session.stop_event.wait(0.25)
+                    continue
+                session.approval_signature = None
+
                 if snapshot and last_sent_transcript is None:
                     transcript = self._assistant_transcript_from_capture(snapshot)
                     last_sent_transcript = transcript
@@ -1247,6 +1290,193 @@ class CliBridgePlugin:
                 logger.debug("cli-bridge capture reader failed: %s", exc)
                 self._audit("capture_reader_error", session, event, error=str(exc))
             session.stop_event.wait(0.25)
+
+    def _codex_approval_from_capture(
+        self,
+        session: BridgeSession,
+        snapshot: str,
+    ) -> dict[str, str] | None:
+        if session.agent != "codex" or not snapshot:
+            return None
+        lines = [line.strip() for line in snapshot.splitlines() if line.strip()]
+        if not lines:
+            return None
+        lowered = "\n".join(lines).lower()
+        markers = (
+            "would you like to make the following edits",
+            "would you like to run the following command",
+            "command approval required",
+            "requires approval",
+            "press enter to confirm or esc to cancel",
+        )
+        if not any(marker in lowered for marker in markers):
+            return None
+        if not (
+            "yes, proceed" in lowered
+            or "allow once" in lowered
+            or "press enter to confirm" in lowered
+            or "don't ask again" in lowered
+        ):
+            return None
+
+        marker_idx = 0
+        for idx, line in enumerate(lines):
+            if any(marker in line.lower() for marker in markers):
+                marker_idx = idx
+                break
+        start = max(0, marker_idx - 8)
+        end = min(len(lines), marker_idx + 14)
+        preview = "\n".join(lines[start:end]).strip()
+        signature = hashlib.sha256(preview.encode("utf-8", errors="replace")).hexdigest()
+        return {"signature": signature, "preview": preview}
+
+    def _handle_tmux_approval(
+        self,
+        session: BridgeSession,
+        gateway: Any,
+        event: Any,
+        approval: dict[str, str],
+    ) -> None:
+        preview = approval.get("preview", "")
+        fields = _event_log_fields(event)
+        logger.info(
+            "cli-bridge tmux approval requested: agent=%s platform=%s chat=%s "
+            "user=%s session=%s prompt=%r",
+            session.agent,
+            fields["platform"],
+            fields["chat"],
+            fields["user"],
+            session.session_name,
+            self._log_snippet(preview),
+        )
+        self._audit(
+            "tmux_approval_requested",
+            session,
+            event,
+            prompt=self._audit_snippet(preview),
+        )
+        choice = self._request_tmux_approval_decision(session, gateway, event, preview)
+        logger.info(
+            "cli-bridge tmux approval resolved: agent=%s platform=%s chat=%s "
+            "user=%s session=%s choice=%s",
+            session.agent,
+            fields["platform"],
+            fields["chat"],
+            fields["user"],
+            session.session_name,
+            choice,
+        )
+        self._audit("tmux_approval_resolved", session, event, choice=choice)
+        self._send_tmux_approval_choice(session, choice)
+
+    def _request_tmux_approval_decision(
+        self,
+        session: BridgeSession,
+        gateway: Any,
+        event: Any,
+        preview: str,
+    ) -> str:
+        session_key = self._gateway_session_key(gateway, event) or session.key
+        approval_data = {
+            "command": f"Codex tmux approval in {session.cwd}\n\n{preview}",
+            "description": "Codex is waiting for permission in the tmux bridge.",
+            "pattern_key": "codex tmux approval",
+            "pattern_keys": ["codex tmux approval"],
+        }
+
+        def _notify(data: dict[str, Any]) -> None:
+            self._send_tmux_approval_request(gateway, event, session_key, data)
+
+        try:
+            from tools.approval import _await_gateway_decision
+
+            result = _await_gateway_decision(
+                session_key,
+                _notify,
+                approval_data,
+                surface="cli_bridge_tmux",
+            )
+        except Exception as exc:
+            logger.warning("cli-bridge tmux approval flow failed: %s", exc)
+            self._reply(
+                gateway,
+                event,
+                f"[{session.agent}] approval flow failed; cancelling Codex request: {exc}",
+            )
+            return "deny"
+
+        if not result.get("resolved"):
+            self._reply(
+                gateway,
+                event,
+                f"[{session.agent}] approval timed out or could not be delivered; cancelling.",
+            )
+            return "deny"
+        return str(result.get("choice") or "deny")
+
+    def _gateway_session_key(self, gateway: Any, event: Any) -> str:
+        session_key_fn = getattr(gateway, "_session_key_for_source", None)
+        if callable(session_key_fn):
+            try:
+                return str(session_key_fn(getattr(event, "source", None)) or "")
+            except Exception:
+                return ""
+        return ""
+
+    def _send_tmux_approval_request(
+        self,
+        gateway: Any,
+        event: Any,
+        session_key: str,
+        approval_data: dict[str, Any],
+    ) -> None:
+        adapter, metadata = self._adapter_and_metadata(gateway, event)
+        if adapter is None:
+            raise RuntimeError("no adapter available for approval request")
+
+        source = getattr(event, "source", None)
+        chat_id = str(getattr(source, "chat_id", "") or "")
+        command = str(approval_data.get("command") or "")
+        description = str(approval_data.get("description") or "permission request")
+        send_exec_approval = getattr(adapter, "send_exec_approval", None)
+        if callable(send_exec_approval):
+            result = send_exec_approval(
+                chat_id=chat_id,
+                command=command,
+                session_key=session_key,
+                description=description,
+                metadata=metadata,
+            )
+            if inspect.isawaitable(result):
+                result = self._run_awaitable(gateway, result, timeout=15)
+            if getattr(result, "success", False):
+                return
+            logger.warning(
+                "cli-bridge tmux approval button send failed: %s",
+                getattr(result, "error", "unknown error"),
+            )
+
+        prefix = getattr(adapter, "typed_command_prefix", "/")
+        self._reply(
+            gateway,
+            event,
+            (
+                f"[codex] Permission requested in tmux.\n"
+                f"Reply `{prefix}approve`, `{prefix}approve session`, "
+                f"`{prefix}approve always`, or `{prefix}deny`.\n\n"
+                f"{self._snippet(command, 1200)}"
+            ),
+        )
+
+    def _send_tmux_approval_choice(self, session: BridgeSession, choice: str) -> None:
+        normalized = (choice or "deny").strip().lower()
+        if normalized == "once":
+            keys = ["y"]
+        elif normalized in {"session", "always"}:
+            keys = ["a"]
+        else:
+            keys = ["Escape"]
+        self.tmux.send_keys(session.session_name, keys)
 
     def _pipe_output_reader(self, session: BridgeSession, gateway: Any, event: Any) -> None:
         offset = 0
