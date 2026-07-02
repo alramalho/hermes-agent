@@ -19,6 +19,7 @@ The host must have `tmux` and the target CLI installed and authenticated.
 /codex init [name] [--cwd <cwd>]  Start or attach a named Codex session.
 /codex list                       Show sessions for this chat/user.
 /codex select <name|none>         Choose the current session, or clear it.
+/codex rename <new-name>          Rename the current bridge session.
 /codex send <text>                Send text exactly, including CLI slash commands.
 /codex status [name|current]      Show session status.
 /codex kill [name|current]        Kill a session. `/codex end` aliases this.
@@ -26,6 +27,7 @@ The host must have `tmux` and the target CLI installed and authenticated.
 /claude init [name] [--cwd <cwd>]
 /claude list
 /claude select <name|none>
+/claude rename <new-name>
 /claude send <text>
 /claude status [name|current]
 /claude kill [name|current]
@@ -40,6 +42,22 @@ the CLI. Use `/codex select none` or `/claude select none` to keep sessions aliv
 while sending ordinary messages back to Hermes. Hermes slash commands stay
 available. To send a slash command to the CLI, use `/codex send /command` or
 `/claude send /command`.
+
+## Slash command forwarding
+
+Hermes keeps ownership of top-level slash commands. That means `/model` still
+opens Hermes model selection, even when a Codex bridge is selected. Prefix CLI
+slash commands with `/codex send`:
+
+```text
+/codex init api --cwd /path/to/repo
+/codex send /model
+/codex send /rename backend-session
+```
+
+Use `/codex rename backend-session` when you want to rename Hermes' bridge route;
+use `/codex send /rename backend-session` when you want Codex to rename its own
+conversation.
 
 ## Configuration
 
