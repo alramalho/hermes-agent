@@ -254,6 +254,10 @@ class CliBridgePlugin:
         self.chunk_chars = _env_int("HERMES_CLI_BRIDGE_CHUNK_CHARS", 3500)
         self.max_output_chars = _env_int("HERMES_CLI_BRIDGE_MAX_OUTPUT_CHARS", 12000)
         self.exec_timeout = _env_float("HERMES_CLI_BRIDGE_EXEC_TIMEOUT", 1800.0)
+        self.startup_ready_timeout = _env_float(
+            "HERMES_CLI_BRIDGE_STARTUP_READY_TIMEOUT",
+            20.0,
+        )
         self.voice_transcription_enabled = _env_bool(
             "HERMES_CLI_BRIDGE_TRANSCRIBE_VOICE",
             True,
@@ -469,7 +473,8 @@ class CliBridgePlugin:
                     command=command,
                     log_path=log_path,
                     pipe_log=self.raw_log_enabled or self.output_source == "pipe",
-            )
+                )
+                self._wait_for_tmux_ready(session, event)
             self._sessions[key] = session
 
             if backend == "tmux" and self.enable_output_reader:
@@ -664,6 +669,58 @@ class CliBridgePlugin:
             logger.warning("cli-bridge exec backend is only implemented for codex; using tmux")
             return "tmux"
         return backend
+
+    def _wait_for_tmux_ready(self, session: BridgeSession, event: Any) -> bool:
+        capture = getattr(self.tmux, "capture", None)
+        if not callable(capture) or self.startup_ready_timeout <= 0:
+            return True
+
+        deadline = time.monotonic() + self.startup_ready_timeout
+        last_snapshot = ""
+        while time.monotonic() < deadline:
+            if session.stop_event.is_set():
+                return False
+            try:
+                snapshot = self._clean_output(capture(session.session_name))
+            except Exception:
+                snapshot = ""
+            last_snapshot = snapshot or last_snapshot
+            if self._tmux_snapshot_ready(session.agent, snapshot):
+                self._audit(
+                    "session_ready",
+                    session,
+                    event,
+                    snapshot=self._audit_snippet(snapshot),
+                )
+                return True
+            time.sleep(0.25)
+
+        logger.warning(
+            "cli-bridge tmux session did not become ready before timeout: "
+            "agent=%s session=%s timeout=%.1f snapshot=%r",
+            session.agent,
+            session.session_name,
+            self.startup_ready_timeout,
+            self._log_snippet(last_snapshot),
+        )
+        self._audit(
+            "session_ready_timeout",
+            session,
+            event,
+            timeout=self.startup_ready_timeout,
+            snapshot=self._audit_snippet(last_snapshot),
+        )
+        return False
+
+    def _tmux_snapshot_ready(self, agent: str, snapshot: str) -> bool:
+        if not snapshot.strip():
+            return False
+        if agent == "codex":
+            lower = snapshot.lower()
+            if "loading" in lower or "starting mcp servers" in lower:
+                return False
+            return "OpenAI Codex" in snapshot and "\n›" in f"\n{snapshot}"
+        return True
 
     def _tmux_submit_keys(self, agent: str) -> list[str]:
         raw = (

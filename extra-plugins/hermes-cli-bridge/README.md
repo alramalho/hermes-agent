@@ -43,6 +43,7 @@ HERMES_CLI_BRIDGE_OUTPUT_INTERVAL=1.0
 HERMES_CLI_BRIDGE_CHUNK_CHARS=3500
 HERMES_CLI_BRIDGE_MAX_OUTPUT_CHARS=12000
 HERMES_CLI_BRIDGE_EXEC_TIMEOUT=1800
+HERMES_CLI_BRIDGE_STARTUP_READY_TIMEOUT=20
 HERMES_CLI_BRIDGE_TRANSCRIBE_VOICE=1
 HERMES_CLI_BRIDGE_TRANSCRIBE_TIMEOUT=120
 HERMES_CLI_BRIDGE_TMUX_SUBMIT_KEYS=Escape,Enter
@@ -71,6 +72,9 @@ treat a lone `Enter` or `C-m` as an inserted newline. Override with
 `HERMES_CLI_BRIDGE_TMUX_SUBMIT_KEYS` when a target CLI needs different keys.
 `HERMES_CLI_BRIDGE_TMUX_KEY_DELAY` adds a small pause between keys so terminal
 UIs can process mode changes such as `Escape` before the submit key arrives.
+`HERMES_CLI_BRIDGE_STARTUP_READY_TIMEOUT` makes `/codex init` wait for the
+initial Codex prompt to be ready, so the next Telegram message is not typed
+while the TUI is still loading.
 
 When the Codex tmux UI asks for permission, the bridge reuses Hermes' existing
 Telegram approval buttons. `Allow Once` sends `y`, `Session` and `Always` send

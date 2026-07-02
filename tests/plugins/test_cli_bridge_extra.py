@@ -29,6 +29,9 @@ class FakeTmux:
         self.submit_keys: list[tuple[str, list[str]]] = []
         self.keys: list[tuple[str, list[str]]] = []
         self.stopped: list[str] = []
+        self.capture_text = "OpenAI Codex\nmodel: gpt-5.5\n› Explain this codebase"
+        self.captures: list[str] = []
+        self.capture_calls: list[str] = []
 
     def start(self, **kwargs) -> None:
         session_name = str(kwargs["session_name"])
@@ -50,6 +53,12 @@ class FakeTmux:
 
     def send_keys(self, session_name: str, keys: list[str]) -> None:
         self.keys.append((session_name, list(keys)))
+
+    def capture(self, session_name: str) -> str:
+        self.capture_calls.append(session_name)
+        if self.captures:
+            return self.captures.pop(0)
+        return self.capture_text
 
     def stop(self, session_name: str) -> None:
         self.sessions.discard(session_name)
@@ -134,6 +143,29 @@ def test_codex_init_starts_tmux_and_skips_gateway(tmp_path: Path, monkeypatch) -
     assert len(fake_tmux.started) == 1
     assert fake_tmux.started[0]["cwd"] == tmp_path
     assert fake_tmux.started[0]["command"] == "codex"
+    assert replies[-1].startswith("[codex] started in")
+
+
+def test_codex_init_waits_for_tmux_ready(tmp_path: Path, monkeypatch) -> None:
+    fake_tmux = FakeTmux()
+    fake_tmux.captures = [
+        "",
+        "OpenAI Codex\nmodel: loading\n› Explain this codebase",
+        "OpenAI Codex\n• Starting MCP servers (2/6)\n› Explain this codebase",
+        "OpenAI Codex\nmodel: gpt-5.5\n› Explain this codebase",
+    ]
+    replies: list[str] = []
+    plugin = _plugin(fake_tmux, replies, tmp_path)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr("hermes_cli_bridge.bridge.time.sleep", lambda _seconds: None)
+
+    result = plugin.handle_pre_gateway_dispatch(
+        event=_event("/codex init"),
+        gateway=_gateway(),
+    )
+
+    assert result == {"action": "skip", "reason": "cli-bridge-control"}
+    assert len(fake_tmux.capture_calls) == 4
     assert replies[-1].startswith("[codex] started in")
 
 
@@ -373,6 +405,23 @@ def test_codex_submit_keys_can_be_overridden(tmp_path: Path, monkeypatch) -> Non
     plugin.handle_pre_gateway_dispatch(event=_event("hello"), gateway=_gateway())
 
     assert fake_tmux.submit_keys[-1] == (session_name, ["C-m"])
+
+
+def test_codex_tmux_ready_detection_rejects_startup_states(tmp_path: Path) -> None:
+    plugin = CliBridgePlugin(enable_output_reader=False, state_dir=tmp_path)
+
+    assert not plugin._tmux_snapshot_ready(
+        "codex",
+        "OpenAI Codex\nmodel: loading\n› Explain this codebase",
+    )
+    assert not plugin._tmux_snapshot_ready(
+        "codex",
+        "OpenAI Codex\n• Starting MCP servers (2/6)\n› Explain this codebase",
+    )
+    assert plugin._tmux_snapshot_ready(
+        "codex",
+        "OpenAI Codex\nmodel: gpt-5.5\n› Explain this codebase",
+    )
 
 
 def test_codex_init_uses_configured_command(tmp_path: Path, monkeypatch) -> None:
