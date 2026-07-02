@@ -531,7 +531,7 @@ def test_codex_exec_backend_keeps_uploaded_audio_as_attachment(
     result = plugin.handle_pre_gateway_dispatch(event=event, gateway=Gateway())
 
     deadline = time.time() + 1
-    while time.time() < deadline and not received_inputs:
+    while time.time() < deadline and "[codex]\nAUDIO_OK" not in replies:
         time.sleep(0.01)
 
     assert result == {"action": "skip", "reason": "cli-bridge-input"}
