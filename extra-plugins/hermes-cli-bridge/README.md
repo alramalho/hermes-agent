@@ -16,18 +16,30 @@ The host must have `tmux` and the target CLI installed and authenticated.
 ## Commands
 
 ```text
-/codex init [cwd]      Start Codex in cwd, or the configured default cwd.
-/codex send <text>     Send text exactly, including CLI slash commands.
-/codex status          Show the active session for this chat/user.
-/codex end             Kill the tmux session.
+/codex init [name] [--cwd <cwd>]  Start or attach a named Codex session.
+/codex list                       Show sessions for this chat/user.
+/codex select <name|none>         Choose the current session, or clear it.
+/codex send <text>                Send text exactly, including CLI slash commands.
+/codex status [name|current]      Show session status.
+/codex kill [name|current]        Kill a session. `/codex end` aliases this.
 
-/claude init [cwd]
+/claude init [name] [--cwd <cwd>]
+/claude list
+/claude select <name|none>
 /claude send <text>
-/claude status
-/claude end
+/claude status [name|current]
+/claude kill [name|current]
 ```
 
-While a bridge is active, ordinary non-slash chat messages are sent to the CLI. Hermes slash commands stay available. To send a slash command to the CLI, use `/codex send /command` or `/claude send /command`.
+If you omit `name`, the bridge uses `default`. `current` is reserved as a
+hotword for the selected session. `--cwd` replaces the old positional cwd style,
+though `/codex init /path/to/repo` still works for compatibility.
+
+When a current bridge is selected, ordinary non-slash chat messages are sent to
+the CLI. Use `/codex select none` or `/claude select none` to keep sessions alive
+while sending ordinary messages back to Hermes. Hermes slash commands stay
+available. To send a slash command to the CLI, use `/codex send /command` or
+`/claude send /command`.
 
 ## Configuration
 

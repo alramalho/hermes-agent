@@ -86,6 +86,8 @@ def _redact(text: str) -> str:
 class BridgeSession:
     agent: str
     key: str
+    base_key: str
+    name: str
     session_name: str
     cwd: Path
     command: str
@@ -280,6 +282,7 @@ class CliBridgePlugin:
             else self.state_dir / "events.jsonl"
         )
         self._sessions: dict[str, BridgeSession] = {}
+        self._selected_sessions: dict[str, str] = {}
         self._lock = threading.RLock()
 
     def register(self, ctx: Any) -> None:
@@ -289,7 +292,7 @@ class CliBridgePlugin:
                 agent,
                 handler=lambda raw_args, _agent=agent: self._command_stub(_agent, raw_args),
                 description=f"Control a tmux-backed {agent.title()} CLI bridge.",
-                args_hint="init|send|status|end",
+                args_hint="init|list|select|send|status|kill",
             )
 
     def _command_stub(self, agent: str, raw_args: str) -> str:
@@ -412,25 +415,94 @@ class CliBridgePlugin:
 
         subcommand = argv[0].lower()
         if subcommand == "init":
-            cwd_arg = argv[1] if len(argv) > 1 else None
-            return self._start_session(agent, cwd_arg, event, gateway)
+            try:
+                name, cwd_arg = self._parse_init_args(argv[1:])
+            except ValueError as exc:
+                return f"[{agent}] {exc}"
+            return self._start_session(agent, name, cwd_arg, event, gateway)
+        if subcommand == "list":
+            return self._list_sessions(agent, event)
+        if subcommand == "select":
+            target = argv[1] if len(argv) > 1 else None
+            return self._select_session(agent, target, event)
         if subcommand == "send":
             payload = raw_args.strip().partition(" ")[2]
             return self._send_control(agent, payload, event, gateway)
         if subcommand == "status":
-            return self._status(agent, event)
-        if subcommand == "end":
-            return self._end_session(agent, event)
+            target = argv[1] if len(argv) > 1 else None
+            return self._status(agent, event, target=target)
+        if subcommand in {"kill", "end"}:
+            target = argv[1] if len(argv) > 1 else "current"
+            return self._kill_session(agent, event, target=target)
         return f"[{agent}] unknown subcommand: {subcommand}\n\n{self._help(agent)}"
+
+    def _parse_init_args(self, argv: list[str]) -> tuple[str, str | None]:
+        name = "default"
+        cwd_arg: str | None = None
+        positional: list[str] = []
+        idx = 0
+        while idx < len(argv):
+            item = argv[idx]
+            if item == "--cwd":
+                if idx + 1 >= len(argv):
+                    raise ValueError("usage: init [name] [--cwd <cwd>]")
+                cwd_arg = argv[idx + 1]
+                idx += 2
+                continue
+            if item.startswith("--cwd="):
+                cwd_arg = item.split("=", 1)[1]
+                if not cwd_arg:
+                    raise ValueError("usage: init [name] [--cwd <cwd>]")
+                idx += 1
+                continue
+            if item.startswith("-"):
+                raise ValueError(f"unknown init option: {item}")
+            positional.append(item)
+            idx += 1
+
+        if len(positional) > 1:
+            raise ValueError("usage: init [name] [--cwd <cwd>]")
+        if positional:
+            candidate = positional[0]
+            if cwd_arg is None and self._looks_like_path(candidate):
+                cwd_arg = candidate
+            else:
+                name = self._normalize_bridge_name(candidate)
+        return name, cwd_arg
+
+    def _looks_like_path(self, value: str) -> bool:
+        return (
+            value.startswith(("/", "./", "../", "~"))
+            or "/" in value
+            or "\\" in value
+        )
+
+    def _normalize_bridge_name(self, name: str) -> str:
+        normalized = name.strip()
+        if not normalized:
+            raise ValueError("session name cannot be empty")
+        lower = normalized.lower()
+        if lower == "current":
+            raise ValueError("'current' is reserved; choose another session name")
+        if lower in {"none", "all"}:
+            raise ValueError(f"'{normalized}' is reserved; choose another session name")
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}", normalized):
+            raise ValueError(
+                "session name must use letters, numbers, dot, underscore, or dash"
+            )
+        return normalized
 
     def _start_session(
         self,
         agent: str,
+        name: str,
         cwd_arg: str | None,
         event: Any,
         gateway: Any,
     ) -> str:
-        key = self._session_key(agent, getattr(event, "source", None))
+        source = getattr(event, "source", None)
+        base_key = self._base_session_key(agent, source)
+        key = self._session_key(agent, source, name)
         with self._lock:
             existing = self._sessions.get(key)
             if (
@@ -441,8 +513,9 @@ class CliBridgePlugin:
                 )
             ):
                 label = "exec" if existing.backend == "exec" else "tmux"
+                self._selected_sessions[base_key] = name
                 return (
-                    f"[{agent}] already active in {existing.cwd}\n"
+                    f"[{agent}:{name}] already active in {existing.cwd}\n"
                     f"{label}: {existing.session_name}"
                 )
             if existing is not None:
@@ -452,13 +525,15 @@ class CliBridgePlugin:
             command = self._agent_command(agent)
             backend = self._agent_backend(agent)
             suffix = hashlib.sha256(key.encode("utf-8")).hexdigest()[:10]
-            session_name = _safe_name(f"hermes-{agent}-{suffix}")[:64]
+            session_name = _safe_name(f"hermes-{agent}-{name}-{suffix}")[:64]
             if backend == "exec":
-                session_name = _safe_name(f"hermes-{agent}-exec-{suffix}")[:64]
+                session_name = _safe_name(f"hermes-{agent}-exec-{name}-{suffix}")[:64]
             log_path = self.state_dir / f"{session_name}.log"
             session = BridgeSession(
                 agent=agent,
                 key=key,
+                base_key=base_key,
+                name=name,
                 session_name=session_name,
                 cwd=cwd,
                 command=command,
@@ -486,13 +561,15 @@ class CliBridgePlugin:
                 )
                 session.reader = reader
                 reader.start()
+            self._selected_sessions[base_key] = name
 
         action = "attached to existing session" if attached else "started"
         fields = _event_log_fields(event)
         logger.info(
-            "cli-bridge session %s: agent=%s backend=%s platform=%s chat=%s user=%s session=%s cwd=%s",
+            "cli-bridge session %s: agent=%s bridge=%s backend=%s platform=%s chat=%s user=%s session=%s cwd=%s",
             "attached" if attached else "started",
             agent,
+            name,
             session.backend,
             fields["platform"],
             fields["chat"],
@@ -507,9 +584,10 @@ class CliBridgePlugin:
             cwd=str(cwd),
             command=command,
             backend=session.backend,
+            name=name,
         )
         label = "tmux" if session.backend == "tmux" else "exec"
-        return f"[{agent}] {action} in {cwd}\n{label}: {session_name}"
+        return f"[{agent}:{name}] {action} in {cwd}\n{label}: {session_name}"
 
     def _send_control(self, agent: str, payload: str, event: Any, gateway: Any) -> str:
         if not payload:
@@ -555,38 +633,98 @@ class CliBridgePlugin:
             return f"[{agent}] busy; previous prompt is still running."
         return f"[{agent}] sent."
 
-    def _status(self, agent: str, event: Any) -> str:
-        session = self._session_for_event(event, agent=agent, require_live=True)
+    def _list_sessions(self, agent: str, event: Any) -> str:
+        source = getattr(event, "source", None)
+        base_key = self._base_session_key(agent, source)
+        with self._lock:
+            sessions = self._sessions_for_base_locked(agent, source, require_live=True)
+            selected = self._selected_sessions.get(base_key)
+        if not sessions:
+            return f"[{agent}] no bridge sessions for this chat."
+        lines = [f"[{agent}] sessions:"]
+        for session in sorted(sessions, key=lambda item: item.name):
+            marker = "*" if session.name == selected else "-"
+            lines.append(
+                f"{marker} {session.name} ({session.backend}) {session.cwd} "
+                f"[{session.session_name}]"
+            )
+        if selected is None:
+            lines.append("No current session selected.")
+        return "\n".join(lines)
+
+    def _select_session(self, agent: str, target: str | None, event: Any) -> str:
+        if target is None:
+            return self._list_sessions(agent, event)
+        source = getattr(event, "source", None)
+        base_key = self._base_session_key(agent, source)
+        if target == "none":
+            with self._lock:
+                self._selected_sessions.pop(base_key, None)
+            return f"[{agent}] no current session selected."
+        if target == "current":
+            session = self._session_for_event(event, agent=agent, require_live=True)
+            if session is None:
+                return self._list_sessions(agent, event)
+            return f"[{agent}] current: {session.name}"
+        try:
+            name = self._normalize_bridge_name(target)
+        except ValueError as exc:
+            return f"[{agent}] {exc}"
+        with self._lock:
+            session = self._sessions.get(self._session_key(agent, source, name))
+            session = self._live_or_drop_locked(session) if session is not None else None
+            if session is None:
+                return f"[{agent}] no session named {name!r}.\n\n{self._list_sessions(agent, event)}"
+            self._selected_sessions[base_key] = name
+        return f"[{agent}] selected {name}."
+
+    def _status(self, agent: str, event: Any, *, target: str | None = None) -> str:
+        session = self._session_for_event(
+            event,
+            agent=agent,
+            require_live=True,
+            target=target,
+        )
         if session is None:
-            return f"[{agent}] no active bridge for this chat."
+            return self._list_sessions(agent, event)
         return (
-            f"[{agent}] active\n"
+            f"[{agent}:{session.name}] active\n"
             f"backend: {session.backend}\n"
             f"cwd: {session.cwd}\n"
             f"session: {session.session_name}"
             + (f"\nthread: {session.thread_id}" if session.thread_id else "")
         )
 
-    def _end_session(self, agent: str, event: Any) -> str:
-        key = self._session_key(agent, getattr(event, "source", None))
+    def _kill_session(self, agent: str, event: Any, *, target: str = "current") -> str:
+        source = getattr(event, "source", None)
         with self._lock:
-            session = self._sessions.pop(key, None)
+            session = self._session_for_event_locked(
+                event,
+                agent=agent,
+                require_live=True,
+                target=target,
+            )
+            if session is not None:
+                self._sessions.pop(session.key, None)
         if session is None:
-            return f"[{agent}] no active bridge for this chat."
+            return self._list_sessions(agent, event)
         session.stop_event.set()
         if session.backend == "tmux":
             self.tmux.stop(session.session_name)
+        if self._selected_sessions.get(session.base_key) == session.name:
+            self._selected_sessions.pop(session.base_key, None)
         fields = _event_log_fields(event)
         logger.info(
-            "cli-bridge session ended: agent=%s platform=%s chat=%s user=%s session=%s",
+            "cli-bridge session ended: agent=%s bridge=%s platform=%s chat=%s user=%s session=%s",
             agent,
+            session.name,
             fields["platform"],
             fields["chat"],
             fields["user"],
             session.session_name,
         )
         self._audit("session_ended", session, event)
-        return f"[{agent}] ended {session.backend} session {session.session_name}."
+        return f"[{agent}:{session.name}] killed {session.backend} session {session.session_name}."
 
     def _session_for_event(
         self,
@@ -594,27 +732,103 @@ class CliBridgePlugin:
         *,
         agent: str | None = None,
         require_live: bool = False,
+        target: str | None = None,
+    ) -> BridgeSession | None:
+        with self._lock:
+            return self._session_for_event_locked(
+                event,
+                agent=agent,
+                require_live=require_live,
+                target=target,
+            )
+
+    def _session_for_event_locked(
+        self,
+        event: Any,
+        *,
+        agent: str | None = None,
+        require_live: bool = False,
+        target: str | None = None,
     ) -> BridgeSession | None:
         source = getattr(event, "source", None)
-        with self._lock:
-            if agent is not None:
-                session = self._sessions.get(self._session_key(agent, source))
-                return self._live_or_drop_locked(session) if require_live else session
-            for candidate in ("codex", "claude"):
-                session = self._sessions.get(self._session_key(candidate, source))
-                if session is not None:
-                    if not require_live:
-                        return session
-                    live = self._live_or_drop_locked(session)
-                    if live is not None:
-                        return live
+        if agent is not None:
+            return self._selected_or_named_session_locked(
+                agent,
+                source,
+                require_live=require_live,
+                target=target,
+            )
+        for candidate in ("codex", "claude"):
+            session = self._selected_or_named_session_locked(
+                candidate,
+                source,
+                require_live=require_live,
+                target=target,
+            )
+            if session is not None:
+                return session
         return None
+
+    def _selected_or_named_session_locked(
+        self,
+        agent: str,
+        source: Any,
+        *,
+        require_live: bool,
+        target: str | None = None,
+    ) -> BridgeSession | None:
+        base_key = self._base_session_key(agent, source)
+        name: str | None
+        if target and target != "current":
+            try:
+                name = self._normalize_bridge_name(target)
+            except ValueError:
+                return None
+        else:
+            name = self._selected_sessions.get(base_key)
+
+        if name is not None:
+            session = self._sessions.get(self._session_key(agent, source, name))
+            return self._live_or_drop_locked(session) if require_live else session
+
+        sessions = self._sessions_for_base_locked(
+            agent,
+            source,
+            require_live=require_live,
+        )
+        if len(sessions) == 1:
+            return sessions[0]
+        return None
+
+    def _sessions_for_base_locked(
+        self,
+        agent: str,
+        source: Any,
+        *,
+        require_live: bool,
+    ) -> list[BridgeSession]:
+        base_key = self._base_session_key(agent, source)
+        sessions = [
+            session
+            for session in list(self._sessions.values())
+            if session.agent == agent and session.base_key == base_key
+        ]
+        if not require_live:
+            return sessions
+        live: list[BridgeSession] = []
+        for session in sessions:
+            candidate = self._live_or_drop_locked(session)
+            if candidate is not None:
+                live.append(candidate)
+        return live
 
     def _drop_session_locked(self, session: BridgeSession) -> None:
         session.stop_event.set()
         if session.backend == "tmux":
             self.tmux.stop(session.session_name)
         self._sessions.pop(session.key, None)
+        if self._selected_sessions.get(session.base_key) == session.name:
+            self._selected_sessions.pop(session.base_key, None)
 
     def _live_or_drop_locked(self, session: BridgeSession | None) -> BridgeSession | None:
         if session is None:
@@ -625,9 +839,11 @@ class CliBridgePlugin:
             return session
         session.stop_event.set()
         self._sessions.pop(session.key, None)
+        if self._selected_sessions.get(session.base_key) == session.name:
+            self._selected_sessions.pop(session.base_key, None)
         return None
 
-    def _session_key(self, agent: str, source: Any) -> str:
+    def _base_session_key(self, agent: str, source: Any) -> str:
         platform = _platform_value(getattr(source, "platform", ""))
         parts = [
             agent,
@@ -639,6 +855,9 @@ class CliBridgePlugin:
             str(getattr(source, "user_id", "") or ""),
         ]
         return "\x1f".join(parts)
+
+    def _session_key(self, agent: str, source: Any, name: str = "default") -> str:
+        return f"{self._base_session_key(agent, source)}\x1f{name}"
 
     def _resolve_cwd(self, cwd_arg: str | None) -> Path:
         cwd_raw = (
@@ -1824,10 +2043,14 @@ class CliBridgePlugin:
 
     def _help(self, agent: str) -> str:
         return (
-            f"/{agent} init [cwd] - start a tmux-backed {agent} session\n"
+            f"/{agent} init [name] [--cwd <cwd>] - start or attach a named session\n"
+            f"/{agent} list - show this chat's sessions\n"
+            f"/{agent} select <name|none> - choose the current session\n"
             f"/{agent} send <text> - send exact text, including slash commands\n"
-            f"/{agent} status - show this chat's bridge status\n"
-            f"/{agent} end - kill this chat's tmux session\n\n"
-            "While active, ordinary non-slash messages go to the CLI. "
-            f"Use /{agent} send /command for CLI slash commands."
+            f"/{agent} status [name|current] - show bridge status\n"
+            f"/{agent} kill [name|current] - kill a session\n\n"
+            f"`/{agent} end` is an alias for `/{agent} kill current`. "
+            "When a current session is selected, ordinary non-slash messages "
+            f"go to the CLI. Use /{agent} select none to return ordinary "
+            f"messages to Hermes, and /{agent} send /command for CLI slash commands."
         )
