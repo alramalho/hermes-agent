@@ -77,8 +77,10 @@ initial Codex prompt to be ready, so the next Telegram message is not typed
 while the TUI is still loading.
 
 When the Codex tmux UI asks for permission, the bridge reuses Hermes' existing
-Telegram approval buttons. `Allow Once` sends `y`, `Session` and `Always` send
-`a`, and `Deny` sends `Escape` back to the tmux pane.
+Telegram approval buttons. `Allow Once` sends `y`; `Session` and `Always` send
+the key shown by Codex's "don't ask again" option, such as `a` for file edits
+or `p` for command-pattern approvals; `Deny` sends `Escape` back to the tmux
+pane.
 
 Set `HERMES_CLI_BRIDGE_CODEX_BACKEND=exec` to route Codex prompts through
 `codex exec` / `codex exec resume` instead of the interactive TUI. This is more

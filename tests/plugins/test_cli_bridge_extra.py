@@ -728,14 +728,25 @@ def test_codex_tmux_approval_choice_maps_to_tmux_keys(tmp_path: Path) -> None:
     session = SimpleNamespace(session_name="hermes-codex-test")
 
     plugin._send_tmux_approval_choice(session, "once")
-    plugin._send_tmux_approval_choice(session, "session")
-    plugin._send_tmux_approval_choice(session, "always")
+    plugin._send_tmux_approval_choice(
+        session,
+        "session",
+        preview="2. Yes, and don't ask again for these files (a)",
+    )
+    plugin._send_tmux_approval_choice(
+        session,
+        "always",
+        preview=(
+            "2. Yes, and don't ask again for commands that start with "
+            "`mkdir -p /tmp/x && printf ok > /tmp/x/file` (p)"
+        ),
+    )
     plugin._send_tmux_approval_choice(session, "deny")
 
     assert fake_tmux.keys == [
         ("hermes-codex-test", ["y"]),
         ("hermes-codex-test", ["a"]),
-        ("hermes-codex-test", ["a"]),
+        ("hermes-codex-test", ["p"]),
         ("hermes-codex-test", ["Escape"]),
     ]
 

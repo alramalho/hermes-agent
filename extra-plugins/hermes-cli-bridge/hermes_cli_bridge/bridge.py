@@ -1424,7 +1424,7 @@ class CliBridgePlugin:
             choice,
         )
         self._audit("tmux_approval_resolved", session, event, choice=choice)
-        self._send_tmux_approval_choice(session, choice)
+        self._send_tmux_approval_choice(session, choice, preview=preview)
 
     def _request_tmux_approval_decision(
         self,
@@ -1525,15 +1525,30 @@ class CliBridgePlugin:
             ),
         )
 
-    def _send_tmux_approval_choice(self, session: BridgeSession, choice: str) -> None:
+    def _send_tmux_approval_choice(
+        self,
+        session: BridgeSession,
+        choice: str,
+        *,
+        preview: str = "",
+    ) -> None:
         normalized = (choice or "deny").strip().lower()
         if normalized == "once":
             keys = ["y"]
         elif normalized in {"session", "always"}:
-            keys = ["a"]
+            keys = [self._codex_persistent_approval_key(preview)]
         else:
             keys = ["Escape"]
         self.tmux.send_keys(session.session_name, keys)
+
+    def _codex_persistent_approval_key(self, preview: str) -> str:
+        for line in preview.splitlines():
+            if "don't ask again" not in line.lower():
+                continue
+            match = re.search(r"\(([A-Za-z])\)", line)
+            if match:
+                return match.group(1)
+        return "a"
 
     def _pipe_output_reader(self, session: BridgeSession, gateway: Any, event: Any) -> None:
         offset = 0
