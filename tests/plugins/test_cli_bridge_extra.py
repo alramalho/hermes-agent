@@ -1086,6 +1086,57 @@ def test_capture_transcript_drops_status_only_updates(tmp_path: Path) -> None:
     assert plugin._assistant_transcript_from_capture(snapshot) == ""
 
 
+def test_capture_transcript_suppresses_repeated_working_timer_updates(
+    tmp_path: Path,
+) -> None:
+    plugin = CliBridgePlugin(enable_output_reader=False, state_dir=tmp_path)
+    before = """
+• Ran hermes config set browser.cloud_provider browserbase
+  └─ ✔ Set browser.cloud_provider = browserbase in /home/alex/.hermes/config.yaml
+• Working (49s • esc to interrupt)
+"""
+    after = """
+• Ran hermes config set browser.cloud_provider browserbase
+  └─ ✔ Set browser.cloud_provider = browserbase in /home/alex/.hermes/config.yaml
+• Working (54s • esc to interrupt)
+"""
+
+    before_transcript = plugin._assistant_transcript_from_capture(before)
+    after_transcript = plugin._assistant_transcript_from_capture(after)
+
+    assert before_transcript == (
+        "Ran hermes config set browser.cloud_provider browserbase\n"
+        "└─ ✔ Set browser.cloud_provider = browserbase in /home/alex/.hermes/config.yaml"
+    )
+    assert after_transcript == before_transcript
+    assert plugin._transcript_delta(before_transcript, after_transcript) == ""
+
+
+def test_capture_status_filter_does_not_drop_normal_working_prose(
+    tmp_path: Path,
+) -> None:
+    plugin = CliBridgePlugin(enable_output_reader=False, state_dir=tmp_path)
+    snapshot = """
+• Working with Hermes slash commands requires explicit forwarding.
+• Starting MCP servers is not necessary for this explanation.
+• Thinking through the edge case is useful.
+"""
+
+    assert plugin._assistant_transcript_from_capture(snapshot) == (
+        "Working with Hermes slash commands requires explicit forwarding.\n\n"
+        "Starting MCP servers is not necessary for this explanation.\n\n"
+        "Thinking through the edge case is useful."
+    )
+
+
+def test_transcript_delta_strips_leaked_codex_status_lines(tmp_path: Path) -> None:
+    plugin = CliBridgePlugin(enable_output_reader=False, state_dir=tmp_path)
+    previous = "Ran command\n└─ ✔ ok\n• Working (51s • esc to interrupt)"
+    current = "Ran command\n└─ ✔ ok\n• Working (52s • esc to interrupt)"
+
+    assert plugin._transcript_delta(previous, current) == ""
+
+
 def test_log_snippet_caps_and_escapes_newlines(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setenv("HERMES_CLI_BRIDGE_LOG_SNIPPET_CHARS", "8")
     plugin = CliBridgePlugin(enable_output_reader=False, state_dir=tmp_path)

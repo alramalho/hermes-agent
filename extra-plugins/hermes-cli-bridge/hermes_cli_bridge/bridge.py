@@ -25,6 +25,16 @@ logger = logging.getLogger("gateway.cli_bridge")
 _OSC_RE = re.compile(r"\x1B\](?:[^\x07\x1B]|\x1B(?!\\))*?(?:\x07|\x1B\\)")
 _ANSI_RE = re.compile(r"\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
 _CONTROL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+_CAPTURE_BULLET_RE = re.compile(r"^[•·∙]\s+(.*)$")
+_CODEX_PROGRESS_STATUS_RE = re.compile(
+    r"^(?:Working|Thinking) "
+    r"\(\d+(?:\.\d+)?s\s+[•·∙]\s+esc to interrupt\)$"
+)
+_CODEX_MCP_STATUS_RE = re.compile(
+    r"^Starting MCP servers?"
+    r"(?: \(\d+/\d+\): .+)? "
+    r"\(\d+(?:\.\d+)?s\s+[•·∙]\s+esc to interrupt\)$"
+)
 
 
 def _env_float(name: str, default: float) -> float:
@@ -1833,7 +1843,7 @@ class CliBridgePlugin:
                         pending += data
                 now = time.monotonic()
                 if pending and now - last_flush >= self.output_interval:
-                    cleaned = self._clean_output(pending)
+                    cleaned = self._strip_capture_status_lines(self._clean_output(pending))
                     pending = ""
                     last_flush = now
                     if cleaned:
@@ -1920,15 +1930,15 @@ class CliBridgePlugin:
                 in_user_prompt = True
                 continue
 
-            if line.startswith("• "):
+            bullet_body = self._capture_bullet_body(line)
+            if bullet_body is not None:
                 if in_assistant:
                     flush_current()
                 in_user_prompt = False
                 if self._is_capture_status_line(line):
                     in_assistant = False
                     continue
-                body = line[2:].strip()
-                current = [body] if body else []
+                current = [bullet_body] if bullet_body else []
                 in_assistant = True
                 continue
 
@@ -1947,6 +1957,8 @@ class CliBridgePlugin:
         return "\n\n".join(blocks).strip()
 
     def _transcript_delta(self, previous: str, current: str) -> str:
+        previous = self._strip_capture_status_lines(previous)
+        current = self._strip_capture_status_lines(current)
         if previous == current or not current:
             return ""
         if not previous:
@@ -1980,14 +1992,15 @@ class CliBridgePlugin:
             if line.startswith("›"):
                 skipping_prompt = True
                 continue
-            if skipping_prompt and not line.startswith("•"):
+            if skipping_prompt and self._capture_bullet_body(line) is None:
                 continue
             skipping_prompt = False
 
             if self._is_capture_status_line(line):
                 continue
-            if line.startswith("• "):
-                line = line[2:].strip()
+            bullet_body = self._capture_bullet_body(line)
+            if bullet_body is not None:
+                line = bullet_body
             if line:
                 lines.append(line)
         return "\n".join(lines).strip()
@@ -2044,15 +2057,28 @@ class CliBridgePlugin:
             return True
         return "usage limit reset" in line or "usage limit resets" in line
 
+    def _capture_bullet_body(self, line: str) -> str | None:
+        match = _CAPTURE_BULLET_RE.match(line)
+        if match is None:
+            return None
+        return match.group(1).strip()
+
     def _is_capture_status_line(self, line: str) -> bool:
-        normalized = line[2:].strip() if line.startswith("• ") else line
-        status_prefixes = (
-            "Working",
-            "Thinking",
-            "Starting MCP servers",
-            "Starting MCP server",
-        )
-        return normalized.startswith(status_prefixes)
+        normalized = self._capture_bullet_body(line) or line.strip()
+        if _CODEX_PROGRESS_STATUS_RE.fullmatch(normalized):
+            return True
+        if _CODEX_MCP_STATUS_RE.fullmatch(normalized):
+            return True
+        return False
+
+    def _strip_capture_status_lines(self, text: str) -> str:
+        lines: list[str] = []
+        for line in text.splitlines():
+            stripped = line.strip()
+            if stripped and self._is_capture_status_line(stripped):
+                continue
+            lines.append(line.rstrip())
+        return "\n".join(lines).strip()
 
     def _clean_output(self, text: str) -> str:
         cleaned = _OSC_RE.sub("", text)
