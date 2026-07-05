@@ -540,6 +540,7 @@ class CliBridgePlugin:
             cwd = self._resolve_cwd(cwd_arg)
             command = self._agent_command(agent)
             backend = self._agent_backend(agent)
+            self._ensure_agent_command_available(agent, command, backend=backend)
             suffix = hashlib.sha256(key.encode("utf-8")).hexdigest()[:10]
             session_name = _safe_name(f"hermes-{agent}-{name}-{suffix}")[:64]
             if backend == "exec":
@@ -565,7 +566,12 @@ class CliBridgePlugin:
                     log_path=log_path,
                     pipe_log=self.raw_log_enabled or self.output_source == "pipe",
                 )
-                self._wait_for_tmux_ready(session, event)
+                ready = self._wait_for_tmux_ready(session, event)
+                if not ready and not self.tmux.has_session(session.session_name):
+                    raise RuntimeError(
+                        f"{agent} command exited before becoming ready: {command!r}. "
+                        f"Check that the CLI is installed and authenticated on this host."
+                    )
             self._sessions[key] = session
             self._ensure_tmux_reader(session, gateway, event)
             self._selected_sessions[base_key] = name
@@ -1202,6 +1208,38 @@ class CliBridgePlugin:
             return "tmux"
         return backend
 
+    def _ensure_agent_command_available(
+        self,
+        agent: str,
+        command: str,
+        *,
+        backend: str,
+    ) -> None:
+        executable = self._command_executable(command)
+        if not executable:
+            return
+        if Path(executable).expanduser().exists() or shutil.which(executable):
+            return
+        raise RuntimeError(
+            f"{agent} {backend} command not found on PATH: {executable!r}. "
+            f"Install it or set HERMES_CLI_BRIDGE_{agent.upper()}_CMD."
+        )
+
+    def _command_executable(self, command: str) -> str | None:
+        if not command.strip() or re.search(r"[|&;<>()$`]", command):
+            return None
+        try:
+            parts = shlex.split(command)
+        except ValueError:
+            return None
+        while parts and "=" in parts[0] and not parts[0].startswith(("/", "./", "../")):
+            parts.pop(0)
+        if parts and parts[0] == "env":
+            parts.pop(0)
+            while parts and "=" in parts[0]:
+                parts.pop(0)
+        return parts[0] if parts else None
+
     def _wait_for_tmux_ready(self, session: BridgeSession, event: Any) -> bool:
         capture = getattr(self.tmux, "capture", None)
         if not callable(capture) or self.startup_ready_timeout <= 0:
@@ -1211,6 +1249,21 @@ class CliBridgePlugin:
         last_snapshot = ""
         while time.monotonic() < deadline:
             if session.stop_event.is_set():
+                return False
+            if not self.tmux.has_session(session.session_name):
+                logger.warning(
+                    "cli-bridge tmux session exited before ready: agent=%s session=%s command=%r",
+                    session.agent,
+                    session.session_name,
+                    session.command,
+                )
+                self._audit(
+                    "session_exited_before_ready",
+                    session,
+                    event,
+                    command=session.command,
+                    snapshot=self._audit_snippet(last_snapshot),
+                )
                 return False
             try:
                 snapshot = self._clean_output(capture(session.session_name))

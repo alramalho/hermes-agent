@@ -179,13 +179,15 @@ def _plugin(
     tmp_path: Path,
     **kwargs,
 ) -> CliBridgePlugin:
-    return CliBridgePlugin(
+    plugin = CliBridgePlugin(
         tmux=fake_tmux,  # type: ignore[arg-type]
         sender=lambda _gateway, _event, text: replies.append(text),
         enable_output_reader=False,
         state_dir=tmp_path,
         **kwargs,
     )
+    plugin._ensure_agent_command_available = lambda *_args, **_kwargs: None  # type: ignore[method-assign]
+    return plugin
 
 
 def test_register_adds_hook_and_commands() -> None:
@@ -901,6 +903,63 @@ def test_claude_init_starts_tmux_with_claude_command(tmp_path: Path, monkeypatch
     assert fake_tmux.started[0]["cwd"] == tmp_path
     assert fake_tmux.started[0]["command"] == "claude"
     assert replies[-1].startswith("[claude:default] started in")
+
+
+def test_init_reports_missing_agent_command_without_starting_tmux(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    fake_tmux = FakeTmux()
+    replies: list[str] = []
+    plugin = CliBridgePlugin(
+        tmux=fake_tmux,  # type: ignore[arg-type]
+        sender=lambda _gateway, _event, text: replies.append(text),
+        enable_output_reader=False,
+        state_dir=tmp_path,
+    )
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("HERMES_CLI_BRIDGE_CLAUDE_CMD", "missing-claude")
+    monkeypatch.setattr(
+        "hermes_cli_bridge.bridge.shutil.which",
+        lambda name: None if name == "missing-claude" else f"/usr/bin/{name}",
+    )
+
+    result = plugin.handle_pre_gateway_dispatch(
+        event=_event("/claude init"),
+        gateway=_gateway(),
+    )
+
+    assert result == {"action": "skip", "reason": "cli-bridge-control"}
+    assert fake_tmux.started == []
+    assert replies[-1].startswith(
+        "[claude] failed: claude tmux command not found on PATH: 'missing-claude'."
+    )
+
+
+def test_init_reports_tmux_exit_before_ready_without_registering_session(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    class ExitingTmux(FakeTmux):
+        def start(self, **kwargs) -> None:
+            super().start(**kwargs)
+            self.sessions.discard(str(kwargs["session_name"]))
+
+    fake_tmux = ExitingTmux()
+    replies: list[str] = []
+    plugin = _plugin(fake_tmux, replies, tmp_path)
+    monkeypatch.chdir(tmp_path)
+
+    result = plugin.handle_pre_gateway_dispatch(
+        event=_event("/claude init"),
+        gateway=_gateway(),
+    )
+
+    assert result == {"action": "skip", "reason": "cli-bridge-control"}
+    assert replies[-1].startswith(
+        "[claude] failed: claude command exited before becoming ready: 'claude'."
+    )
+    assert plugin._sessions == {}
 
 
 def test_claude_tmux_uses_plain_enter_submit(tmp_path: Path, monkeypatch) -> None:
