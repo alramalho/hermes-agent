@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import difflib
 import hashlib
 import inspect
@@ -400,7 +401,7 @@ class CliBridgePlugin:
         raw_args: str,
         event: Any,
         gateway: Any,
-    ) -> str:
+    ) -> str | None:
         try:
             argv = shlex.split(raw_args)
         except ValueError as exc:
@@ -415,6 +416,8 @@ class CliBridgePlugin:
                 name, cwd_arg = self._parse_init_args(argv[1:])
             except ValueError as exc:
                 return f"[{agent}] {exc}"
+            if self._schedule_telegram_topic_init(agent, name, cwd_arg, event, gateway):
+                return None
             return self._start_session(agent, name, cwd_arg, event, gateway)
         if subcommand == "list":
             if len(argv) > 2 or (len(argv) == 2 and not self._is_all_option(argv[1])):
@@ -483,6 +486,126 @@ class CliBridgePlugin:
 
     def _is_all_option(self, value: str) -> bool:
         return value == "--all" or value in {"—all", "–all", "−all"}
+
+    def _schedule_telegram_topic_init(
+        self,
+        agent: str,
+        name: str,
+        cwd_arg: str | None,
+        event: Any,
+        gateway: Any,
+    ) -> bool:
+        if not self._should_auto_create_telegram_topic(event, gateway):
+            return False
+
+        worker = self._telegram_topic_init_worker(agent, name, cwd_arg, event, gateway)
+        loop = getattr(gateway, "_gateway_loop", None)
+        if loop is not None and loop.is_running():
+            asyncio.run_coroutine_threadsafe(worker, loop)
+            return True
+
+        def _run_worker() -> None:
+            try:
+                asyncio.run(worker)
+            except Exception as exc:
+                logger.warning("cli-bridge topic init worker failed: %s", exc)
+
+        thread = threading.Thread(
+            target=_run_worker,
+            name=f"hermes-cli-bridge-topic-init-{agent}",
+            daemon=True,
+        )
+        thread.start()
+        return True
+
+    def _should_auto_create_telegram_topic(self, event: Any, gateway: Any) -> bool:
+        if not _env_bool("HERMES_CLI_BRIDGE_TELEGRAM_TOPICS", True):
+            return False
+        source = getattr(event, "source", None)
+        if _platform_value(getattr(source, "platform", "")) != "telegram":
+            return False
+        if str(getattr(source, "chat_type", "") or "") != "dm":
+            return False
+        if not str(getattr(source, "chat_id", "") or ""):
+            return False
+        thread_id = str(getattr(source, "thread_id", "") or "")
+        if thread_id and thread_id != "1":
+            return False
+        adapter = self._adapter_for_source(gateway, source)
+        return callable(getattr(adapter, "ensure_dm_topic", None))
+
+    async def _telegram_topic_init_worker(
+        self,
+        agent: str,
+        name: str,
+        cwd_arg: str | None,
+        event: Any,
+        gateway: Any,
+    ) -> None:
+        reply_event = event
+        topic_name = self._telegram_bridge_topic_name(agent, name)
+        topic_note = ""
+        try:
+            topic_event = await self._telegram_topic_event(event, gateway, topic_name)
+            if topic_event is not None:
+                reply_event = topic_event
+                topic_note = f"\ntopic: {topic_name}"
+            else:
+                topic_note = "\ntopic: unavailable; started in this chat"
+
+            reply = await asyncio.to_thread(
+                self._start_session,
+                agent,
+                name,
+                cwd_arg,
+                reply_event,
+                gateway,
+            )
+            if topic_note:
+                reply += topic_note
+        except Exception as exc:
+            logger.warning("cli-bridge topic init failed: %s", exc)
+            reply = f"[{agent}] failed: {exc}"
+        self._reply(gateway, reply_event, reply)
+
+    async def _telegram_topic_event(
+        self,
+        event: Any,
+        gateway: Any,
+        topic_name: str,
+    ) -> Any | None:
+        source = getattr(event, "source", None)
+        adapter = self._adapter_for_source(gateway, source)
+        ensure_topic = getattr(adapter, "ensure_dm_topic", None)
+        if not callable(ensure_topic):
+            return None
+        chat_id = str(getattr(source, "chat_id", "") or "")
+        result = ensure_topic(chat_id, topic_name)
+        thread_id = await result if inspect.isawaitable(result) else result
+        if not thread_id:
+            return None
+        return self._event_with_thread(event, str(thread_id), topic_name)
+
+    def _adapter_for_source(self, gateway: Any, source: Any) -> Any | None:
+        adapters = getattr(gateway, "adapters", {}) or {}
+        platform = getattr(source, "platform", None)
+        return adapters.get(platform) or adapters.get(_platform_value(platform))
+
+    def _event_with_thread(self, event: Any, thread_id: str, topic_name: str) -> Any:
+        source = getattr(event, "source", None)
+        new_source = dataclasses.replace(
+            source,
+            thread_id=str(thread_id),
+            chat_topic=topic_name,
+        )
+        return dataclasses.replace(event, source=new_source)
+
+    def _telegram_bridge_topic_name(self, agent: str, name: str) -> str:
+        raw = f"{agent}: {name}"
+        cleaned = re.sub(r"\s+", " ", raw).strip()
+        if len(cleaned) > 120:
+            cleaned = cleaned[:117].rstrip() + "..."
+        return cleaned or agent
 
     def _normalize_bridge_name(self, name: str) -> str:
         normalized = name.strip()

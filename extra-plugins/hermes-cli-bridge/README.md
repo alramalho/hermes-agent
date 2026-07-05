@@ -47,6 +47,12 @@ and Claude bridge sessions for the same chat/user scope, including sessions in
 other Telegram topics. Unicode dash variants such as `/codex list —all` are
 accepted too, because some Telegram clients autocorrect `--`.
 
+In Telegram DMs, `/codex init api --cwd <cwd>` or `/claude init docs --cwd <cwd>`
+from the main chat automatically creates/reuses a DM topic named `codex: api` or
+`claude: docs`, starts the bridge there, and sends bridge output back to that
+topic. Running `init` inside an existing Telegram topic keeps using that topic.
+Set `HERMES_CLI_BRIDGE_TELEGRAM_TOPICS=0` to disable automatic topic creation.
+
 When a current bridge is selected, ordinary non-slash chat messages are sent to
 the CLI. Use `/codex select none` or `/claude select none` to keep sessions alive
 while sending ordinary messages back to Hermes. Hermes slash commands stay

@@ -166,10 +166,16 @@ def _event(
     )
 
 
-def _gateway(*, authorized: bool = True) -> SimpleNamespace:
+def _gateway(
+    *,
+    authorized: bool = True,
+    adapters: dict | None = None,
+    gateway_loop=None,
+) -> SimpleNamespace:
     return SimpleNamespace(
         _is_user_authorized=lambda source: authorized,
-        adapters={},
+        adapters=adapters or {},
+        _gateway_loop=gateway_loop,
     )
 
 
@@ -365,6 +371,85 @@ def test_list_all_shows_codex_and_claude_sessions_across_topics(
     plugin.handle_pre_gateway_dispatch(event=_event("/claude list –all"), gateway=_gateway())
     assert "codex:api (tmux)" in replies[-1]
     assert "claude:docs (tmux)" in replies[-1]
+
+
+def test_init_from_telegram_root_creates_topic_and_routes_session(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    fake_tmux = FakeTmux()
+    sent: list[tuple[str, str | None]] = []
+    topic_calls: list[tuple[str, str]] = []
+
+    class Adapter:
+        async def ensure_dm_topic(self, chat_id, topic_name, force_create=False):
+            del force_create
+            topic_calls.append((chat_id, topic_name))
+            return "topic-api"
+
+    plugin = CliBridgePlugin(
+        tmux=fake_tmux,  # type: ignore[arg-type]
+        sender=lambda _gateway, event, text: sent.append(
+            (text, getattr(event.source, "thread_id", None))
+        ),
+        enable_output_reader=False,
+        state_dir=tmp_path,
+    )
+    plugin._ensure_agent_command_available = lambda *_args, **_kwargs: None  # type: ignore[method-assign]
+    monkeypatch.chdir(tmp_path)
+
+    result = plugin.handle_pre_gateway_dispatch(
+        event=_event("/codex init api"),
+        gateway=_gateway(adapters={Platform.TELEGRAM: Adapter()}),
+    )
+
+    deadline = time.time() + 2
+    while time.time() < deadline and not sent:
+        time.sleep(0.01)
+
+    assert result == {"action": "skip", "reason": "cli-bridge-control"}
+    assert topic_calls == [("chat1", "codex: api")]
+    assert sent
+    assert sent[-1][1] == "topic-api"
+    assert sent[-1][0].startswith("[codex:api] started in")
+    assert "topic: codex: api" in sent[-1][0]
+
+    plugin.handle_pre_gateway_dispatch(
+        event=_event("hello topic", thread_id="topic-api"),
+        gateway=_gateway(adapters={Platform.TELEGRAM: Adapter()}),
+    )
+
+    assert fake_tmux.inputs[-1] == (
+        str(fake_tmux.started[0]["session_name"]),
+        "hello topic",
+    )
+
+
+def test_init_inside_existing_telegram_topic_does_not_create_topic(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    fake_tmux = FakeTmux()
+    replies: list[str] = []
+    topic_calls: list[tuple[str, str]] = []
+
+    class Adapter:
+        async def ensure_dm_topic(self, chat_id, topic_name, force_create=False):
+            del force_create
+            topic_calls.append((chat_id, topic_name))
+            return "unused"
+
+    plugin = _plugin(fake_tmux, replies, tmp_path)
+    monkeypatch.chdir(tmp_path)
+
+    result = plugin.handle_pre_gateway_dispatch(
+        event=_event("/codex init api", thread_id="existing-topic"),
+        gateway=_gateway(adapters={Platform.TELEGRAM: Adapter()}),
+    )
+
+    assert result == {"action": "skip", "reason": "cli-bridge-control"}
+    assert topic_calls == []
+    assert replies[-1].startswith("[codex:api] started in")
 
 
 def test_named_sessions_can_be_listed_selected_and_cleared(
