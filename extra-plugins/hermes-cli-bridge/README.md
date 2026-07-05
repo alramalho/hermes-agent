@@ -44,7 +44,8 @@ gateway/plugin restart can reattach to still-running tmux sessions and continue
 exec-backed provider threads. Dead tmux sessions are pruned the next time they
 are listed or selected. `/codex list --all` and `/claude list --all` show Codex
 and Claude bridge sessions for the same chat/user scope, including sessions in
-other Telegram topics.
+other Telegram topics. Unicode dash variants such as `/codex list —all` are
+accepted too, because some Telegram clients autocorrect `--`.
 
 When a current bridge is selected, ordinary non-slash chat messages are sent to
 the CLI. Use `/codex select none` or `/claude select none` to keep sessions alive

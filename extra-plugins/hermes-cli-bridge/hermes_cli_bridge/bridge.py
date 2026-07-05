@@ -417,7 +417,7 @@ class CliBridgePlugin:
                 return f"[{agent}] {exc}"
             return self._start_session(agent, name, cwd_arg, event, gateway)
         if subcommand == "list":
-            if len(argv) > 2 or (len(argv) == 2 and argv[1] != "--all"):
+            if len(argv) > 2 or (len(argv) == 2 and not self._is_all_option(argv[1])):
                 return f"[{agent}] usage: /{agent} list [--all]"
             return self._list_sessions(agent, event, include_all=len(argv) == 2)
         if subcommand == "select":
@@ -480,6 +480,9 @@ class CliBridgePlugin:
             or "/" in value
             or "\\" in value
         )
+
+    def _is_all_option(self, value: str) -> bool:
+        return value == "--all" or value in {"—all", "–all", "−all"}
 
     def _normalize_bridge_name(self, name: str) -> str:
         normalized = name.strip()

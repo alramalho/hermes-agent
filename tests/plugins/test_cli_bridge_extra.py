@@ -356,6 +356,14 @@ def test_list_all_shows_codex_and_claude_sessions_across_topics(
     assert "codex:api (tmux)" in claude_reply
     assert "claude:docs (tmux)" in claude_reply
 
+    plugin.handle_pre_gateway_dispatch(event=_event("/codex list —all"), gateway=_gateway())
+    assert "codex:api (tmux)" in replies[-1]
+    assert "claude:docs (tmux)" in replies[-1]
+
+    plugin.handle_pre_gateway_dispatch(event=_event("/claude list –all"), gateway=_gateway())
+    assert "codex:api (tmux)" in replies[-1]
+    assert "claude:docs (tmux)" in replies[-1]
+
 
 def test_named_sessions_can_be_listed_selected_and_cleared(
     tmp_path: Path,
