@@ -108,6 +108,7 @@ class BridgeSession:
     send_mutex: threading.Lock = field(default_factory=threading.Lock)
     queued_sends: deque = field(default_factory=deque)
     sender_active: bool = False
+    restored: bool = False
 
 
 class TmuxClient:
@@ -283,6 +284,7 @@ class CliBridgePlugin:
         self._sessions: dict[str, BridgeSession] = {}
         self._selected_sessions: dict[str, str] = {}
         self._lock = threading.RLock()
+        self._load_session_registry()
 
     def register(self, ctx: Any) -> None:
         ctx.register_hook("pre_gateway_dispatch", self.handle_pre_gateway_dispatch)
@@ -415,7 +417,9 @@ class CliBridgePlugin:
                 return f"[{agent}] {exc}"
             return self._start_session(agent, name, cwd_arg, event, gateway)
         if subcommand == "list":
-            return self._list_sessions(agent, event)
+            if len(argv) > 2 or (len(argv) == 2 and argv[1] != "--all"):
+                return f"[{agent}] usage: /{agent} list [--all]"
+            return self._list_sessions(agent, event, include_all=len(argv) == 2)
         if subcommand == "select":
             target = argv[1] if len(argv) > 1 else None
             return self._select_session(agent, target, event)
@@ -513,9 +517,18 @@ class CliBridgePlugin:
                 )
             ):
                 label = "exec" if existing.backend == "exec" else "tmux"
+                action = (
+                    "attached to existing session"
+                    if existing.restored
+                    else "already active"
+                )
+                existing.restored = False
                 self._selected_sessions[base_key] = name
+                self._ensure_tmux_reader(existing, gateway, event)
+                existing.last_activity = time.time()
+                self._persist_session_registry_locked()
                 return (
-                    f"[{agent}:{name}] already active in {existing.cwd}\n"
+                    f"[{agent}:{name}] {action} in {existing.cwd}\n"
                     f"{label}: {existing.session_name}"
                 )
             if existing is not None:
@@ -551,17 +564,9 @@ class CliBridgePlugin:
                 )
                 self._wait_for_tmux_ready(session, event)
             self._sessions[key] = session
-
-            if backend == "tmux" and self.enable_output_reader:
-                reader = threading.Thread(
-                    target=self._output_reader,
-                    args=(session, gateway, event),
-                    name=f"hermes-cli-bridge-{agent}",
-                    daemon=True,
-                )
-                session.reader = reader
-                reader.start()
+            self._ensure_tmux_reader(session, gateway, event)
             self._selected_sessions[base_key] = name
+            self._persist_session_registry_locked()
 
         action = "attached to existing session" if attached else "started"
         fields = _event_log_fields(event)
@@ -630,22 +635,55 @@ class CliBridgePlugin:
             return f"[{agent}] busy; previous prompt is still running."
         return f"[{agent}] sent."
 
-    def _list_sessions(self, agent: str, event: Any) -> str:
+    def _list_sessions(
+        self,
+        agent: str,
+        event: Any,
+        *,
+        include_all: bool = False,
+    ) -> str:
         source = getattr(event, "source", None)
         base_key = self._base_session_key(agent, source)
         with self._lock:
-            sessions = self._sessions_for_base_locked(agent, source, require_live=True)
+            if include_all:
+                sessions = self._sessions_for_source_scope_locked(
+                    source,
+                    require_live=True,
+                )
+            else:
+                sessions = self._sessions_for_base_locked(
+                    agent,
+                    source,
+                    require_live=True,
+                )
             selected = self._selected_sessions.get(base_key)
+            selected_by_base = dict(self._selected_sessions)
         if not sessions:
             return f"[{agent}] no bridge sessions for this chat."
-        lines = [f"[{agent}] sessions:"]
-        for session in sorted(sessions, key=lambda item: item.name):
+        lines = [f"[{agent}] {'all bridge sessions' if include_all else 'sessions'}:"]
+        sort_key = (
+            (lambda item: (item.agent, item.name))
+            if include_all
+            else (lambda item: item.name)
+        )
+        for session in sorted(sessions, key=sort_key):
+            if include_all:
+                session_selected = selected_by_base.get(session.base_key)
+                marker = "*" if session.name == session_selected else "-"
+                thread_id = self._base_key_fields(session.base_key)["thread_id"]
+                thread_label = f" topic={thread_id}" if thread_id else ""
+                lines.append(
+                    f"{marker} {session.agent}:{session.name} ({session.backend}) "
+                    f"{session.cwd} [{session.session_name}]{thread_label}"
+                )
+                continue
+
             marker = "*" if session.name == selected else "-"
             lines.append(
                 f"{marker} {session.name} ({session.backend}) {session.cwd} "
                 f"[{session.session_name}]"
             )
-        if selected is None or selected == _NO_SELECTED_SESSION:
+        if not include_all and (selected is None or selected == _NO_SELECTED_SESSION):
             lines.append("No current session selected.")
         return "\n".join(lines)
 
@@ -705,6 +743,7 @@ class CliBridgePlugin:
             session.name = new_name
             self._sessions[new_key] = session
             self._selected_sessions[session.base_key] = new_name
+            self._persist_session_registry_locked()
 
         fields = _event_log_fields(event)
         logger.info(
@@ -774,6 +813,7 @@ class CliBridgePlugin:
             )
             if session is not None:
                 self._sessions.pop(session.key, None)
+                self._persist_session_registry_locked()
         if session is None:
             return self._list_sessions(agent, event)
         session.stop_event.set()
@@ -892,6 +932,27 @@ class CliBridgePlugin:
                 live.append(candidate)
         return live
 
+    def _sessions_for_source_scope_locked(
+        self,
+        source: Any,
+        *,
+        require_live: bool,
+    ) -> list[BridgeSession]:
+        scope = self._source_scope_fields(source)
+        sessions = [
+            session
+            for session in list(self._sessions.values())
+            if self._session_matches_source_scope(session, scope)
+        ]
+        if not require_live:
+            return sessions
+        live: list[BridgeSession] = []
+        for session in sessions:
+            candidate = self._live_or_drop_locked(session)
+            if candidate is not None:
+                live.append(candidate)
+        return live
+
     def _drop_session_locked(self, session: BridgeSession) -> None:
         session.stop_event.set()
         if session.backend == "tmux":
@@ -899,6 +960,7 @@ class CliBridgePlugin:
         self._sessions.pop(session.key, None)
         if self._selected_sessions.get(session.base_key) == session.name:
             self._selected_sessions.pop(session.base_key, None)
+        self._persist_session_registry_locked()
 
     def _live_or_drop_locked(self, session: BridgeSession | None) -> BridgeSession | None:
         if session is None:
@@ -911,6 +973,7 @@ class CliBridgePlugin:
         self._sessions.pop(session.key, None)
         if self._selected_sessions.get(session.base_key) == session.name:
             self._selected_sessions.pop(session.base_key, None)
+        self._persist_session_registry_locked()
         return None
 
     def _base_session_key(self, agent: str, source: Any) -> str:
@@ -928,6 +991,179 @@ class CliBridgePlugin:
 
     def _session_key(self, agent: str, source: Any, name: str = "default") -> str:
         return f"{self._base_session_key(agent, source)}\x1f{name}"
+
+    def _base_key_fields(self, base_key: str) -> dict[str, str]:
+        parts = (base_key.split("\x1f") + [""] * 7)[:7]
+        return {
+            "agent": parts[0],
+            "platform": parts[1],
+            "profile": parts[2],
+            "scope_id": parts[3],
+            "chat_id": parts[4],
+            "thread_id": parts[5],
+            "user_id": parts[6],
+        }
+
+    def _source_scope_fields(self, source: Any) -> dict[str, str]:
+        return {
+            "platform": _platform_value(getattr(source, "platform", "")),
+            "profile": str(getattr(source, "profile", "") or ""),
+            "scope_id": str(getattr(source, "scope_id", "") or ""),
+            "chat_id": str(getattr(source, "chat_id", "") or ""),
+            "user_id": str(getattr(source, "user_id", "") or ""),
+        }
+
+    def _session_matches_source_scope(
+        self,
+        session: BridgeSession,
+        scope: dict[str, str],
+    ) -> bool:
+        fields = self._base_key_fields(session.base_key)
+        return (
+            fields["agent"] in PROFILES
+            and fields["platform"] == scope["platform"]
+            and fields["profile"] == scope["profile"]
+            and fields["scope_id"] == scope["scope_id"]
+            and fields["chat_id"] == scope["chat_id"]
+            and fields["user_id"] == scope["user_id"]
+        )
+
+    @property
+    def _registry_path(self) -> Path:
+        return self.state_dir / "sessions.json"
+
+    def _load_session_registry(self) -> None:
+        path = self._registry_path
+        if not path.exists():
+            return
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            logger.warning("cli-bridge session registry could not be read: %s", exc)
+            return
+        if not isinstance(data, dict):
+            return
+
+        loaded: dict[str, BridgeSession] = {}
+        for record in data.get("sessions", []):
+            if not isinstance(record, dict):
+                continue
+            session = self._session_from_record(record)
+            if session is not None:
+                loaded[session.key] = session
+        self._sessions.update(loaded)
+
+    def _session_from_record(self, record: dict[str, Any]) -> BridgeSession | None:
+        agent = str(record.get("agent") or "")
+        if agent not in PROFILES:
+            return None
+
+        key = str(record.get("key") or "")
+        base_key = str(record.get("base_key") or "")
+        name = str(record.get("name") or "")
+        session_name = str(record.get("session_name") or "")
+        cwd_raw = str(record.get("cwd") or "")
+        if not key or not base_key or not name or not session_name or not cwd_raw:
+            return None
+        try:
+            self._normalize_bridge_name(name)
+        except ValueError:
+            return None
+
+        backend = str(record.get("backend") or "tmux").lower()
+        if backend not in {"tmux", "exec"}:
+            backend = "tmux"
+
+        log_raw = str(record.get("log_path") or "")
+        created_at = self._record_float(record.get("created_at"), time.time())
+        last_activity = self._record_float(record.get("last_activity"), created_at)
+        return BridgeSession(
+            agent=agent,
+            key=key,
+            base_key=base_key,
+            name=name,
+            session_name=session_name,
+            cwd=Path(cwd_raw).expanduser(),
+            command=str(record.get("command") or self._agent_command(agent)),
+            log_path=Path(log_raw).expanduser()
+            if log_raw
+            else self.state_dir / f"{session_name}.log",
+            backend=backend,
+            thread_id=str(record.get("thread_id") or "") or None,
+            created_at=created_at,
+            last_activity=last_activity,
+            restored=True,
+        )
+
+    def _record_float(self, value: Any, default: float) -> float:
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return default
+
+    def _session_record(self, session: BridgeSession) -> dict[str, Any]:
+        return {
+            "agent": session.agent,
+            "key": session.key,
+            "base_key": session.base_key,
+            "name": session.name,
+            "session_name": session.session_name,
+            "cwd": str(session.cwd),
+            "command": session.command,
+            "log_path": str(session.log_path),
+            "backend": session.backend,
+            "thread_id": session.thread_id,
+            "created_at": session.created_at,
+            "last_activity": session.last_activity,
+            "source": self._base_key_fields(session.base_key),
+        }
+
+    def _persist_session_registry_locked(self) -> None:
+        try:
+            records = [
+                self._session_record(session)
+                for session in sorted(
+                    self._sessions.values(),
+                    key=lambda item: (item.agent, item.base_key, item.name),
+                )
+                if not session.stop_event.is_set()
+            ]
+            data = {"version": 1, "sessions": records}
+            path = self._registry_path
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp_path = path.with_name(f"{path.name}.{uuid.uuid4().hex}.tmp")
+            try:
+                tmp_path.write_text(
+                    json.dumps(data, ensure_ascii=True, indent=2, default=str) + "\n",
+                    encoding="utf-8",
+                )
+                tmp_path.replace(path)
+            finally:
+                tmp_path.unlink(missing_ok=True)
+        except Exception as exc:
+            logger.debug("cli-bridge session registry write failed: %s", exc)
+
+    def _ensure_tmux_reader(
+        self,
+        session: BridgeSession,
+        gateway: Any,
+        event: Any,
+    ) -> None:
+        if session.backend != "tmux" or not self.enable_output_reader:
+            return
+        with self._lock:
+            if session.stop_event.is_set():
+                return
+            if session.reader is not None and session.reader.is_alive():
+                return
+            reader = threading.Thread(
+                target=self._output_reader,
+                args=(session, gateway, event),
+                name=f"hermes-cli-bridge-{session.agent}",
+                daemon=True,
+            )
+            session.reader = reader
+            reader.start()
 
     def _resolve_cwd(self, cwd_arg: str | None) -> Path:
         cwd_raw = (
@@ -1097,6 +1333,7 @@ class CliBridgePlugin:
         *,
         allow_voice: bool = True,
     ) -> bool:
+        self._ensure_tmux_reader(session, gateway, event)
         needs_voice = bool(
             allow_voice
             and self.voice_transcription_enabled
@@ -1335,7 +1572,9 @@ class CliBridgePlugin:
                 result.stdout
             )
             if thread_id:
-                session.thread_id = thread_id
+                with self._lock:
+                    session.thread_id = thread_id
+                    self._persist_session_registry_locked()
             output = ""
             if output_path.exists():
                 output = output_path.read_text(encoding="utf-8", errors="replace").strip()
@@ -2059,7 +2298,7 @@ class CliBridgePlugin:
     def _help(self, agent: str) -> str:
         return (
             f"/{agent} init [name] [--cwd <cwd>] - start or attach a named session\n"
-            f"/{agent} list - show this chat's sessions\n"
+            f"/{agent} list [--all] - show this chat's sessions\n"
             f"/{agent} select <name|none> - choose the current session\n"
             f"/{agent} rename <new-name> - rename the current bridge session\n"
             f"/{agent} send <text> - send exact text, including slash commands\n"

@@ -17,7 +17,7 @@ The host must have `tmux` and the target CLI installed and authenticated.
 
 ```text
 /codex init [name] [--cwd <cwd>]  Start or attach a named Codex session.
-/codex list                       Show sessions for this chat/user.
+/codex list [--all]               Show sessions for this chat/user.
 /codex select <name|none>         Choose the current session, or clear it.
 /codex rename <new-name>          Rename the current bridge session.
 /codex send <text>                Send text exactly, including CLI slash commands.
@@ -26,7 +26,7 @@ The host must have `tmux` and the target CLI installed and authenticated.
 /codex kill [name|current]        Kill a session. `/codex end` aliases this.
 
 /claude init [name] [--cwd <cwd>]
-/claude list
+/claude list [--all]
 /claude select <name|none>
 /claude rename <new-name>
 /claude send <text>
@@ -38,6 +38,13 @@ The host must have `tmux` and the target CLI installed and authenticated.
 If you omit `name`, the bridge uses `default`. `current` is reserved as a
 hotword for the selected session. `--cwd` replaces the old positional cwd style,
 though `/codex init /path/to/repo` still works for compatibility.
+
+Bridge sessions are persisted in `~/.hermes/cli-bridge/sessions.json` so a
+gateway/plugin restart can reattach to still-running tmux sessions and continue
+exec-backed provider threads. Dead tmux sessions are pruned the next time they
+are listed or selected. `/codex list --all` and `/claude list --all` show Codex
+and Claude bridge sessions for the same chat/user scope, including sessions in
+other Telegram topics.
 
 When a current bridge is selected, ordinary non-slash chat messages are sent to
 the CLI. Use `/codex select none` or `/claude select none` to keep sessions alive

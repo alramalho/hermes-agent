@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import sys
 import subprocess
 import threading
@@ -146,7 +147,11 @@ class FakeTmux:
         self.stopped.append(session_name)
 
 
-def _event(text: str, user_id: str = "u1") -> MessageEvent:
+def _event(
+    text: str,
+    user_id: str = "u1",
+    thread_id: str | None = None,
+) -> MessageEvent:
     return MessageEvent(
         text=text,
         message_id="m1",
@@ -154,6 +159,7 @@ def _event(text: str, user_id: str = "u1") -> MessageEvent:
             platform=Platform.TELEGRAM,
             chat_id="chat1",
             chat_type="dm",
+            thread_id=thread_id,
             user_id=user_id,
             user_name="Alex",
         ),
@@ -270,6 +276,85 @@ def test_codex_init_reattaches_existing_tmux_after_gateway_restart(
     assert result == {"action": "skip", "reason": "cli-bridge-control"}
     assert len(fake_tmux.started) == 1
     assert replies[-1].startswith("[codex:default] attached to existing session in")
+
+
+def test_sessions_restore_from_registry_and_route_after_restart(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    fake_tmux = FakeTmux()
+    replies: list[str] = []
+    monkeypatch.chdir(tmp_path)
+
+    first = _plugin(fake_tmux, replies, tmp_path)
+    first.handle_pre_gateway_dispatch(event=_event("/codex init api"), gateway=_gateway())
+    session_name = str(fake_tmux.started[0]["session_name"])
+
+    restarted = _plugin(fake_tmux, replies, tmp_path)
+    restarted.handle_pre_gateway_dispatch(event=_event("/codex list"), gateway=_gateway())
+    assert "- api (tmux)" in replies[-1]
+
+    result = restarted.handle_pre_gateway_dispatch(
+        event=_event("after restart"),
+        gateway=_gateway(),
+    )
+
+    assert result == {"action": "skip", "reason": "cli-bridge-input"}
+    assert fake_tmux.inputs[-1] == (session_name, "after restart")
+
+
+def test_stale_registry_session_is_pruned_from_list(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    fake_tmux = FakeTmux()
+    replies: list[str] = []
+    monkeypatch.chdir(tmp_path)
+
+    first = _plugin(fake_tmux, replies, tmp_path)
+    first.handle_pre_gateway_dispatch(event=_event("/codex init api"), gateway=_gateway())
+    fake_tmux.sessions.clear()
+
+    restarted = _plugin(fake_tmux, replies, tmp_path)
+    restarted.handle_pre_gateway_dispatch(event=_event("/codex list"), gateway=_gateway())
+
+    assert replies[-1] == "[codex] no bridge sessions for this chat."
+    registry = json.loads((tmp_path / "sessions.json").read_text(encoding="utf-8"))
+    assert registry["sessions"] == []
+
+
+def test_list_all_shows_codex_and_claude_sessions_across_topics(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    fake_tmux = FakeTmux()
+    replies: list[str] = []
+    plugin = _plugin(fake_tmux, replies, tmp_path)
+    monkeypatch.chdir(tmp_path)
+
+    plugin.handle_pre_gateway_dispatch(
+        event=_event("/codex init api", thread_id="topic-a"),
+        gateway=_gateway(),
+    )
+    fake_tmux.capture_text = CLAUDE_READY_PANE
+    plugin.handle_pre_gateway_dispatch(
+        event=_event("/claude init docs", thread_id="topic-b"),
+        gateway=_gateway(),
+    )
+
+    plugin.handle_pre_gateway_dispatch(event=_event("/codex list --all"), gateway=_gateway())
+    codex_reply = replies[-1]
+    assert codex_reply.startswith("[codex] all bridge sessions:")
+    assert "codex:api (tmux)" in codex_reply
+    assert "topic=topic-a" in codex_reply
+    assert "claude:docs (tmux)" in codex_reply
+    assert "topic=topic-b" in codex_reply
+
+    plugin.handle_pre_gateway_dispatch(event=_event("/claude list --all"), gateway=_gateway())
+    claude_reply = replies[-1]
+    assert claude_reply.startswith("[claude] all bridge sessions:")
+    assert "codex:api (tmux)" in claude_reply
+    assert "claude:docs (tmux)" in claude_reply
 
 
 def test_named_sessions_can_be_listed_selected_and_cleared(
