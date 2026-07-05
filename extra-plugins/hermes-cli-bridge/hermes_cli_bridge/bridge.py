@@ -15,26 +15,21 @@ import shutil
 import subprocess
 import threading
 import time
+import uuid
+from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
+
+from .profiles import PROFILES, AgentProfile
 
 logger = logging.getLogger("gateway.cli_bridge")
 
 _OSC_RE = re.compile(r"\x1B\](?:[^\x07\x1B]|\x1B(?!\\))*?(?:\x07|\x1B\\)")
 _ANSI_RE = re.compile(r"\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
 _CONTROL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
-_CAPTURE_BULLET_RE = re.compile(r"^[•·∙]\s+(.*)$")
-_CODEX_PROGRESS_STATUS_RE = re.compile(
-    r"^(?:Working|Thinking) "
-    r"\(\d+(?:\.\d+)?s\s+[•·∙]\s+esc to interrupt\)$"
-)
-_CODEX_MCP_STATUS_RE = re.compile(
-    r"^Starting MCP servers?"
-    r"(?: \(\d+/\d+\): .+)? "
-    r"\(\d+(?:\.\d+)?s\s+[•·∙]\s+esc to interrupt\)$"
-)
+_NO_SELECTED_SESSION = "\x00none"
 
 
 def _env_float(name: str, default: float) -> float:
@@ -110,6 +105,9 @@ class BridgeSession:
     created_at: float = field(default_factory=time.time)
     last_activity: float = field(default_factory=time.time)
     approval_signature: str | None = None
+    send_mutex: threading.Lock = field(default_factory=threading.Lock)
+    queued_sends: deque = field(default_factory=deque)
+    sender_active: bool = False
 
 
 class TmuxClient:
@@ -211,7 +209,7 @@ class TmuxClient:
         submit_keys: list[str] | None = None,
     ) -> None:
         if "\n" in text:
-            buffer_name = _safe_name(f"{session_name}-input")[:64]
+            buffer_name = _safe_name(f"{session_name}-input-{uuid.uuid4().hex[:8]}")[:64]
             self._run(
                 ["tmux", "load-buffer", "-b", buffer_name, "-"],
                 input=text,
@@ -238,15 +236,6 @@ class TmuxClient:
 
 class CliBridgePlugin:
     """Register and run chat-to-CLI bridge sessions."""
-
-    _AGENT_COMMAND_ENV = {
-        "codex": "HERMES_CLI_BRIDGE_CODEX_CMD",
-        "claude": "HERMES_CLI_BRIDGE_CLAUDE_CMD",
-    }
-    _DEFAULT_COMMANDS = {
-        "codex": "codex",
-        "claude": "claude",
-    }
 
     def __init__(
         self,
@@ -297,12 +286,12 @@ class CliBridgePlugin:
 
     def register(self, ctx: Any) -> None:
         ctx.register_hook("pre_gateway_dispatch", self.handle_pre_gateway_dispatch)
-        for agent in ("codex", "claude"):
+        for agent in PROFILES:
             ctx.register_command(
                 agent,
                 handler=lambda raw_args, _agent=agent: self._command_stub(_agent, raw_args),
                 description=f"Control a tmux-backed {agent.title()} CLI bridge.",
-                args_hint="init|list|select|rename|send|status|kill",
+                args_hint="init|list|select|rename|send|status|exit|kill",
             )
 
     def _command_stub(self, agent: str, raw_args: str) -> str:
@@ -355,12 +344,7 @@ class CliBridgePlugin:
             if session.backend == "exec":
                 routed = self._route_exec_input(session, payload, gateway, event)
             else:
-                self.tmux.send_input(
-                    session.session_name,
-                    payload,
-                    submit_keys=self._tmux_submit_keys(session.agent),
-                )
-                routed = True
+                routed = self._route_tmux_input(session, payload, gateway, event)
             session.last_activity = time.time()
             self._send_typing(gateway, event)
             elapsed_ms = (time.perf_counter() - started) * 1000
@@ -404,7 +388,7 @@ class CliBridgePlugin:
             return None
         head, _, raw_args = stripped[1:].partition(" ")
         command = head.split("@", 1)[0].replace("_", "-").lower()
-        if command not in self._DEFAULT_COMMANDS:
+        if command not in PROFILES:
             return None
         return command, raw_args.strip()
 
@@ -445,6 +429,8 @@ class CliBridgePlugin:
         if subcommand == "status":
             target = argv[1] if len(argv) > 1 else None
             return self._status(agent, event, target=target)
+        if subcommand == "exit":
+            return self._exit_session(agent, event)
         if subcommand in {"kill", "end"}:
             target = argv[1] if len(argv) > 1 else "current"
             return self._kill_session(agent, event, target=target)
@@ -613,12 +599,9 @@ class CliBridgePlugin:
         if session.backend == "exec":
             routed = self._route_exec_input(session, payload, gateway, event)
         else:
-            self.tmux.send_input(
-                session.session_name,
-                payload,
-                submit_keys=self._tmux_submit_keys(session.agent),
+            routed = self._route_tmux_input(
+                session, payload, gateway, event, allow_voice=False
             )
-            routed = True
         session.last_activity = time.time()
         self._send_typing(gateway, event)
         elapsed_ms = (time.perf_counter() - started) * 1000
@@ -662,7 +645,7 @@ class CliBridgePlugin:
                 f"{marker} {session.name} ({session.backend}) {session.cwd} "
                 f"[{session.session_name}]"
             )
-        if selected is None:
+        if selected is None or selected == _NO_SELECTED_SESSION:
             lines.append("No current session selected.")
         return "\n".join(lines)
 
@@ -673,7 +656,7 @@ class CliBridgePlugin:
         base_key = self._base_session_key(agent, source)
         if target == "none":
             with self._lock:
-                self._selected_sessions.pop(base_key, None)
+                self._selected_sessions[base_key] = _NO_SELECTED_SESSION
             return f"[{agent}] no current session selected."
         if target == "current":
             session = self._session_for_event(event, agent=agent, require_live=True)
@@ -754,6 +737,32 @@ class CliBridgePlugin:
             + (f"\nthread: {session.thread_id}" if session.thread_id else "")
         )
 
+    def _exit_session(self, agent: str, event: Any) -> str:
+        source = getattr(event, "source", None)
+        base_key = self._base_session_key(agent, source)
+        with self._lock:
+            session = self._session_for_event_locked(
+                event,
+                agent=agent,
+                require_live=True,
+                target="current",
+            )
+            self._selected_sessions[base_key] = _NO_SELECTED_SESSION
+        if session is None:
+            return f"[{agent}] no current session selected."
+        fields = _event_log_fields(event)
+        logger.info(
+            "cli-bridge session exited: agent=%s bridge=%s platform=%s chat=%s user=%s session=%s",
+            agent,
+            session.name,
+            fields["platform"],
+            fields["chat"],
+            fields["user"],
+            session.session_name,
+        )
+        self._audit("session_exited", session, event)
+        return f"[{agent}:{session.name}] exited bridge; session is still running."
+
     def _kill_session(self, agent: str, event: Any, *, target: str = "current") -> str:
         source = getattr(event, "source", None)
         with self._lock:
@@ -817,7 +826,7 @@ class CliBridgePlugin:
                 require_live=require_live,
                 target=target,
             )
-        for candidate in ("codex", "claude"):
+        for candidate in PROFILES:
             session = self._selected_or_named_session_locked(
                 candidate,
                 source,
@@ -846,6 +855,8 @@ class CliBridgePlugin:
         else:
             name = self._selected_sessions.get(base_key)
 
+        if name == _NO_SELECTED_SESSION:
+            return None
         if name is not None:
             session = self._sessions.get(self._session_key(agent, source, name))
             return self._live_or_drop_locked(session) if require_live else session
@@ -929,9 +940,11 @@ class CliBridgePlugin:
             raise RuntimeError(f"cwd does not exist or is not a directory: {cwd}")
         return cwd
 
+    def _profile(self, agent: str) -> AgentProfile:
+        return PROFILES[agent]
+
     def _agent_command(self, agent: str) -> str:
-        env_name = self._AGENT_COMMAND_ENV[agent]
-        return os.environ.get(env_name, "").strip() or self._DEFAULT_COMMANDS[agent]
+        return self._profile(agent).command()
 
     def _agent_backend(self, agent: str) -> str:
         raw = (
@@ -943,8 +956,10 @@ class CliBridgePlugin:
         if backend not in {"tmux", "exec"}:
             logger.warning("cli-bridge unknown backend %r for %s; using tmux", raw, agent)
             return "tmux"
-        if backend == "exec" and agent != "codex":
-            logger.warning("cli-bridge exec backend is only implemented for codex; using tmux")
+        if backend == "exec" and not self._profile(agent).supports_exec:
+            logger.warning(
+                "cli-bridge exec backend is not implemented for %s; using tmux", agent
+            )
             return "tmux"
         return backend
 
@@ -971,6 +986,14 @@ class CliBridgePlugin:
                     snapshot=self._audit_snippet(snapshot),
                 )
                 return True
+            if self._approval_from_capture(session, snapshot) is not None:
+                self._audit(
+                    "session_ready_dialog",
+                    session,
+                    event,
+                    snapshot=self._audit_snippet(snapshot),
+                )
+                return True
             time.sleep(0.25)
 
         logger.warning(
@@ -991,23 +1014,10 @@ class CliBridgePlugin:
         return False
 
     def _tmux_snapshot_ready(self, agent: str, snapshot: str) -> bool:
-        if not snapshot.strip():
-            return False
-        if agent == "codex":
-            lower = snapshot.lower()
-            if "loading" in lower or "starting mcp servers" in lower:
-                return False
-            return "OpenAI Codex" in snapshot and "\n›" in f"\n{snapshot}"
-        return True
+        return self._profile(agent).snapshot_ready(snapshot)
 
     def _tmux_submit_keys(self, agent: str) -> list[str]:
-        raw = (
-            os.environ.get(f"HERMES_CLI_BRIDGE_{agent.upper()}_SUBMIT_KEYS")
-            or os.environ.get("HERMES_CLI_BRIDGE_TMUX_SUBMIT_KEYS")
-            or ("Escape,Enter" if agent == "codex" else "Enter")
-        )
-        keys = [part.strip() for part in raw.replace(" ", ",").split(",") if part.strip()]
-        return keys or (["Escape", "Enter"] if agent == "codex" else ["Enter"])
+        return self._profile(agent).submit_keys()
 
     def _event_payload(self, event: Any) -> str:
         parts: list[str] = []
@@ -1071,10 +1081,86 @@ class CliBridgePlugin:
             name=f"hermes-cli-bridge-exec-{session.agent}",
             daemon=True,
         )
-        worker.start()
+        try:
+            worker.start()
+        except Exception:
+            session.exec_lock.release()
+            raise
         return True
 
-    def _prepare_exec_payload(
+    def _route_tmux_input(
+        self,
+        session: BridgeSession,
+        payload: str,
+        gateway: Any,
+        event: Any,
+        *,
+        allow_voice: bool = True,
+    ) -> bool:
+        needs_voice = bool(
+            allow_voice
+            and self.voice_transcription_enabled
+            and self._voice_audio_paths(event)
+        )
+        with session.send_mutex:
+            deferred = (
+                needs_voice
+                or session.sender_active
+                or bool(session.queued_sends)
+                or session.approval_signature is not None
+            )
+            if deferred:
+                session.queued_sends.append((payload, needs_voice, gateway, event))
+                if not session.sender_active:
+                    worker = threading.Thread(
+                        target=self._tmux_send_worker,
+                        args=(session,),
+                        name=f"hermes-cli-bridge-send-{session.agent}",
+                        daemon=True,
+                    )
+                    session.sender_active = True
+                    try:
+                        worker.start()
+                    except Exception:
+                        session.sender_active = False
+                        raise
+                return True
+        self.tmux.send_input(
+            session.session_name,
+            payload,
+            submit_keys=self._tmux_submit_keys(session.agent),
+        )
+        return True
+
+    def _tmux_send_worker(self, session: BridgeSession) -> None:
+        while True:
+            with session.send_mutex:
+                if session.stop_event.is_set() or not session.queued_sends:
+                    session.sender_active = False
+                    return
+                payload, needs_voice, gateway, event = session.queued_sends.popleft()
+            try:
+                if needs_voice:
+                    payload = self._prepare_outbound_payload(session, payload, gateway, event)
+                while (
+                    session.approval_signature is not None
+                    and not session.stop_event.is_set()
+                ):
+                    session.stop_event.wait(0.25)
+                if session.stop_event.is_set():
+                    continue
+                self.tmux.send_input(
+                    session.session_name,
+                    payload,
+                    submit_keys=self._tmux_submit_keys(session.agent),
+                )
+                session.last_activity = time.time()
+            except Exception as exc:
+                logger.warning("cli-bridge tmux send worker failed: %s", exc)
+                self._audit("tmux_send_worker_failed", session, event, error=str(exc))
+                self._reply(gateway, event, f"[{session.agent}] send failed: {exc}")
+
+    def _prepare_outbound_payload(
         self,
         session: BridgeSession,
         payload: str,
@@ -1206,10 +1292,12 @@ class CliBridgePlugin:
         started = time.perf_counter()
         output_path = self.state_dir / f"{session.session_name}-last.txt"
         try:
-            payload = self._prepare_exec_payload(session, payload, gateway, event)
+            payload = self._prepare_outbound_payload(session, payload, gateway, event)
             output_path.parent.mkdir(parents=True, exist_ok=True)
             output_path.unlink(missing_ok=True)
-            command = self._codex_exec_command(session, output_path)
+            command = self._profile(session.agent).exec_command(
+                session.thread_id, output_path
+            )
             fields = _event_log_fields(event)
             logger.info(
                 "cli-bridge exec started: agent=%s platform=%s chat=%s user=%s "
@@ -1240,7 +1328,12 @@ class CliBridgePlugin:
                 timeout=self.exec_timeout,
             )
             elapsed_ms = (time.perf_counter() - started) * 1000
-            thread_id, stdout_message = self._parse_codex_exec_stdout(result.stdout)
+            if session.stop_event.is_set():
+                self._audit("exec_discarded_after_kill", session, event)
+                return
+            thread_id, stdout_message = self._profile(session.agent).parse_exec_stdout(
+                result.stdout
+            )
             if thread_id:
                 session.thread_id = thread_id
             output = ""
@@ -1346,65 +1439,16 @@ class CliBridgePlugin:
             session.exec_lock.release()
 
     def _codex_exec_command(self, session: BridgeSession, output_path: Path) -> list[str]:
-        base = self._codex_exec_base_command()
-        common = ["--json", "--output-last-message", str(output_path)]
-        if session.thread_id:
-            return [
-                base[0],
-                "exec",
-                "resume",
-                *base[2:],
-                *common,
-                session.thread_id,
-                "-",
-            ]
-        return [*base, *common, "-"]
+        return self._profile("codex").exec_command(session.thread_id, output_path)
 
-    def _codex_exec_base_command(self) -> list[str]:
-        explicit = os.environ.get("HERMES_CLI_BRIDGE_CODEX_EXEC_CMD", "").strip()
-        if explicit:
-            argv = shlex.split(explicit)
-        else:
-            argv = shlex.split(self._agent_command("codex"))
-            if not argv:
-                argv = ["codex"]
-            argv = [argv[0], "exec", *self._codex_exec_safe_options(argv[1:])]
-        if len(argv) < 2 or argv[1] != "exec":
-            argv = [argv[0], "exec", *argv[1:]]
-        return argv
-
-    def _codex_exec_safe_options(self, options: list[str]) -> list[str]:
-        safe: list[str] = []
-        skip_next = False
-        drop_with_value = {"--remote", "--remote-auth-token-env"}
-        for option in options:
-            if skip_next:
-                skip_next = False
-                continue
-            if option == "--no-alt-screen":
-                continue
-            if option in drop_with_value:
-                skip_next = True
-                continue
-            if any(option.startswith(f"{drop}=") for drop in drop_with_value):
-                continue
-            safe.append(option)
-        return safe
+    def _claude_exec_command(self, session: BridgeSession, output_path: Path) -> list[str]:
+        return self._profile("claude").exec_command(session.thread_id, output_path)
 
     def _parse_codex_exec_stdout(self, stdout: str) -> tuple[str | None, str]:
-        thread_id = None
-        message = ""
-        for line in stdout.splitlines():
-            try:
-                event = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if event.get("type") == "thread.started":
-                thread_id = str(event.get("thread_id") or "") or thread_id
-            item = event.get("item")
-            if isinstance(item, dict) and item.get("type") == "agent_message":
-                message = str(item.get("text") or "")
-        return thread_id, message
+        return self._profile("codex").parse_exec_stdout(stdout)
+
+    def _parse_claude_exec_stdout(self, stdout: str) -> tuple[str | None, str]:
+        return self._profile("claude").parse_exec_stdout(stdout)
 
     def _reply(self, gateway: Any, event: Any, text: str) -> None:
         if self.sender is not None:
@@ -1526,7 +1570,7 @@ class CliBridgePlugin:
                     break
                 snapshot = self._clean_output(self.tmux.capture(session.session_name))
                 now = time.monotonic()
-                approval = self._codex_approval_from_capture(session, snapshot)
+                approval = self._approval_from_capture(session, snapshot)
                 if approval is not None:
                     signature = str(approval["signature"])
                     if signature != session.approval_signature:
@@ -1539,7 +1583,9 @@ class CliBridgePlugin:
                 session.approval_signature = None
 
                 if snapshot and last_sent_transcript is None:
-                    transcript = self._assistant_transcript_from_capture(snapshot)
+                    transcript = self._assistant_transcript_from_capture(
+                        snapshot, agent=session.agent
+                    )
                     last_sent_transcript = transcript
                     last_snapshot = snapshot
                     last_flush = now
@@ -1570,8 +1616,12 @@ class CliBridgePlugin:
                     and now - last_flush >= self.output_interval
                 ):
                     raw_delta = self._snapshot_delta(last_snapshot, snapshot)
-                    transcript = self._assistant_transcript_from_capture(snapshot)
-                    chat_output = self._transcript_delta(last_sent_transcript, transcript)
+                    transcript = self._assistant_transcript_from_capture(
+                        snapshot, agent=session.agent
+                    )
+                    chat_output = self._transcript_delta(
+                        last_sent_transcript, transcript, agent=session.agent
+                    )
                     last_sent_transcript = transcript
                     last_snapshot = snapshot
                     last_flush = now
@@ -1626,44 +1676,22 @@ class CliBridgePlugin:
                 self._audit("capture_reader_error", session, event, error=str(exc))
             session.stop_event.wait(0.25)
 
-    def _codex_approval_from_capture(
+    def _approval_from_capture(
         self,
-        session: BridgeSession,
+        session: Any,
         snapshot: str,
     ) -> dict[str, str] | None:
-        if session.agent != "codex" or not snapshot:
+        agent = getattr(session, "agent", "codex")
+        if agent not in PROFILES:
             return None
-        lines = [line.strip() for line in snapshot.splitlines() if line.strip()]
-        if not lines:
-            return None
-        lowered = "\n".join(lines).lower()
-        markers = (
-            "would you like to make the following edits",
-            "would you like to run the following command",
-            "command approval required",
-            "requires approval",
-            "press enter to confirm or esc to cancel",
-        )
-        if not any(marker in lowered for marker in markers):
-            return None
-        if not (
-            "yes, proceed" in lowered
-            or "allow once" in lowered
-            or "press enter to confirm" in lowered
-            or "don't ask again" in lowered
-        ):
-            return None
+        return self._profile(agent).approval_from_capture(snapshot)
 
-        marker_idx = 0
-        for idx, line in enumerate(lines):
-            if any(marker in line.lower() for marker in markers):
-                marker_idx = idx
-                break
-        start = max(0, marker_idx - 8)
-        end = min(len(lines), marker_idx + 14)
-        preview = "\n".join(lines[start:end]).strip()
-        signature = hashlib.sha256(preview.encode("utf-8", errors="replace")).hexdigest()
-        return {"signature": signature, "preview": preview}
+    def _codex_approval_from_capture(
+        self,
+        session: Any,
+        snapshot: str,
+    ) -> dict[str, str] | None:
+        return self._approval_from_capture(session, snapshot)
 
     def _handle_tmux_approval(
         self,
@@ -1712,15 +1740,16 @@ class CliBridgePlugin:
         preview: str,
     ) -> str:
         session_key = self._gateway_session_key(gateway, event) or session.key
+        agent = getattr(session, "agent", "codex")
         approval_data = {
-            "command": f"Codex tmux approval in {session.cwd}\n\n{preview}",
-            "description": "Codex is waiting for permission in the tmux bridge.",
-            "pattern_key": "codex tmux approval",
-            "pattern_keys": ["codex tmux approval"],
+            "command": f"{agent.title()} tmux approval in {session.cwd}\n\n{preview}",
+            "description": f"{agent.title()} is waiting for permission in the tmux bridge.",
+            "pattern_key": f"{agent} tmux approval",
+            "pattern_keys": [f"{agent} tmux approval"],
         }
 
         def _notify(data: dict[str, Any]) -> None:
-            self._send_tmux_approval_request(gateway, event, session_key, data)
+            self._send_tmux_approval_request(gateway, event, session_key, data, agent=agent)
 
         try:
             from tools.approval import _await_gateway_decision
@@ -1736,7 +1765,7 @@ class CliBridgePlugin:
             self._reply(
                 gateway,
                 event,
-                f"[{session.agent}] approval flow failed; cancelling Codex request: {exc}",
+                f"[{agent}] approval flow failed; cancelling {agent.title()} request: {exc}",
             )
             return "deny"
 
@@ -1744,7 +1773,7 @@ class CliBridgePlugin:
             self._reply(
                 gateway,
                 event,
-                f"[{session.agent}] approval timed out or could not be delivered; cancelling.",
+                f"[{agent}] approval timed out or could not be delivered; cancelling.",
             )
             return "deny"
         return str(result.get("choice") or "deny")
@@ -1764,6 +1793,8 @@ class CliBridgePlugin:
         event: Any,
         session_key: str,
         approval_data: dict[str, Any],
+        *,
+        agent: str = "codex",
     ) -> None:
         adapter, metadata = self._adapter_and_metadata(gateway, event)
         if adapter is None:
@@ -1796,7 +1827,7 @@ class CliBridgePlugin:
             gateway,
             event,
             (
-                f"[codex] Permission requested in tmux.\n"
+                f"[{agent}] Permission requested in tmux.\n"
                 f"Reply `{prefix}approve`, `{prefix}approve session`, "
                 f"`{prefix}approve always`, or `{prefix}deny`.\n\n"
                 f"{self._snippet(command, 1200)}"
@@ -1805,28 +1836,14 @@ class CliBridgePlugin:
 
     def _send_tmux_approval_choice(
         self,
-        session: BridgeSession,
+        session: Any,
         choice: str,
         *,
         preview: str = "",
     ) -> None:
-        normalized = (choice or "deny").strip().lower()
-        if normalized == "once":
-            keys = ["y"]
-        elif normalized in {"session", "always"}:
-            keys = [self._codex_persistent_approval_key(preview)]
-        else:
-            keys = ["Escape"]
+        agent = getattr(session, "agent", "codex")
+        keys = self._profile(agent).approval_keys(choice, preview)
         self.tmux.send_keys(session.session_name, keys)
-
-    def _codex_persistent_approval_key(self, preview: str) -> str:
-        for line in preview.splitlines():
-            if "don't ask again" not in line.lower():
-                continue
-            match = re.search(r"\(([A-Za-z])\)", line)
-            if match:
-                return match.group(1)
-        return "a"
 
     def _pipe_output_reader(self, session: BridgeSession, gateway: Any, event: Any) -> None:
         offset = 0
@@ -1843,7 +1860,9 @@ class CliBridgePlugin:
                         pending += data
                 now = time.monotonic()
                 if pending and now - last_flush >= self.output_interval:
-                    cleaned = self._strip_capture_status_lines(self._clean_output(pending))
+                    cleaned = self._strip_capture_status_lines(
+                        self._clean_output(pending), agent=session.agent
+                    )
                     pending = ""
                     last_flush = now
                     if cleaned:
@@ -1895,70 +1914,15 @@ class CliBridgePlugin:
                 changed_lines.extend(current_lines[j1:j2])
         return "\n".join(line for line in changed_lines if line.strip()).strip()
 
-    def _chat_output_from_capture_delta(self, delta: str) -> str:
-        return self._assistant_transcript_from_capture(delta)
+    def _chat_output_from_capture_delta(self, delta: str, agent: str = "codex") -> str:
+        return self._assistant_transcript_from_capture(delta, agent=agent)
 
-    def _assistant_transcript_from_capture(self, snapshot: str) -> str:
-        blocks: list[str] = []
-        current: list[str] = []
-        in_assistant = False
-        in_user_prompt = False
+    def _assistant_transcript_from_capture(self, snapshot: str, agent: str = "codex") -> str:
+        return self._profile(agent).assistant_transcript(snapshot)
 
-        def flush_current() -> None:
-            nonlocal current
-            block = "\n".join(line for line in current if line).strip()
-            if block:
-                blocks.append(block)
-            current = []
-
-        for raw_line in snapshot.splitlines():
-            line = raw_line.strip()
-            if not line:
-                continue
-
-            if self._is_capture_chrome_line(line):
-                if in_assistant:
-                    flush_current()
-                in_assistant = False
-                in_user_prompt = False
-                continue
-
-            if line.startswith("›"):
-                if in_assistant:
-                    flush_current()
-                in_assistant = False
-                in_user_prompt = True
-                continue
-
-            bullet_body = self._capture_bullet_body(line)
-            if bullet_body is not None:
-                if in_assistant:
-                    flush_current()
-                in_user_prompt = False
-                if self._is_capture_status_line(line):
-                    in_assistant = False
-                    continue
-                current = [bullet_body] if bullet_body else []
-                in_assistant = True
-                continue
-
-            if in_user_prompt:
-                continue
-
-            if in_assistant:
-                if self._is_capture_status_line(line):
-                    flush_current()
-                    in_assistant = False
-                    continue
-                current.append(line)
-
-        if in_assistant:
-            flush_current()
-        return "\n\n".join(blocks).strip()
-
-    def _transcript_delta(self, previous: str, current: str) -> str:
-        previous = self._strip_capture_status_lines(previous)
-        current = self._strip_capture_status_lines(current)
+    def _transcript_delta(self, previous: str, current: str, agent: str = "codex") -> str:
+        previous = self._strip_capture_status_lines(previous, agent=agent)
+        current = self._strip_capture_status_lines(current, agent=agent)
         if previous == current or not current:
             return ""
         if not previous:
@@ -2044,41 +2008,17 @@ class CliBridgePlugin:
         except Exception as exc:
             logger.debug("cli-bridge audit write failed: %s", exc)
 
-    def _is_capture_chrome_line(self, line: str) -> bool:
-        if line.startswith(("╭", "╰", "│")):
-            return True
-        if line.startswith(("OpenAI Codex", ">_ OpenAI Codex", "model:", "directory:")):
-            return True
-        if "·" in line and "hermes-agent" in line:
-            return True
-        if re.match(r"^gpt-[\w.-]+(?:\s+\w+)?\s+·", line):
-            return True
-        if line.startswith("Tip:"):
-            return True
-        return "usage limit reset" in line or "usage limit resets" in line
+    def _is_capture_chrome_line(self, line: str, agent: str = "codex") -> bool:
+        return self._profile(agent).is_chrome_line(line)
 
-    def _capture_bullet_body(self, line: str) -> str | None:
-        match = _CAPTURE_BULLET_RE.match(line)
-        if match is None:
-            return None
-        return match.group(1).strip()
+    def _capture_bullet_body(self, line: str, agent: str = "codex") -> str | None:
+        return self._profile(agent).bullet_body(line)
 
-    def _is_capture_status_line(self, line: str) -> bool:
-        normalized = self._capture_bullet_body(line) or line.strip()
-        if _CODEX_PROGRESS_STATUS_RE.fullmatch(normalized):
-            return True
-        if _CODEX_MCP_STATUS_RE.fullmatch(normalized):
-            return True
-        return False
+    def _is_capture_status_line(self, line: str, agent: str = "codex") -> bool:
+        return self._profile(agent).is_status_line(line)
 
-    def _strip_capture_status_lines(self, text: str) -> str:
-        lines: list[str] = []
-        for line in text.splitlines():
-            stripped = line.strip()
-            if stripped and self._is_capture_status_line(stripped):
-                continue
-            lines.append(line.rstrip())
-        return "\n".join(lines).strip()
+    def _strip_capture_status_lines(self, text: str, agent: str = "codex") -> str:
+        return self._profile(agent).strip_status_lines(text)
 
     def _clean_output(self, text: str) -> str:
         cleaned = _OSC_RE.sub("", text)
@@ -2124,6 +2064,7 @@ class CliBridgePlugin:
             f"/{agent} rename <new-name> - rename the current bridge session\n"
             f"/{agent} send <text> - send exact text, including slash commands\n"
             f"/{agent} status [name|current] - show bridge status\n"
+            f"/{agent} exit - exit the current bridge without killing it\n"
             f"/{agent} kill [name|current] - kill a session\n\n"
             f"`/{agent} end` is an alias for `/{agent} kill current`. "
             "When a current session is selected, ordinary non-slash messages "

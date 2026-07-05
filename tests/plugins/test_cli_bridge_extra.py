@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import asyncio
 import sys
 import subprocess
+import threading
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -19,6 +21,85 @@ if str(PLUGIN_ROOT) not in sys.path:
 
 from hermes_cli_bridge import CliBridgePlugin, register  # noqa: E402
 from hermes_cli_bridge.bridge import TmuxClient  # noqa: E402
+
+# Pane fixtures below are verbatim shapes captured from claude 2.1.201 and
+# codex 0.142.5 running inside `tmux capture-pane -p -J` at 140x40.
+CLAUDE_READY_PANE = """\
+╭─── Claude Code v2.1.201 ──────────────────────────╮
+│                 Welcome back Alex!                 │
+│ Fable 5 with xhigh effort · Claude Max · Alexandre │
+│         /…/scratchpad/claude-cap/freshdir          │
+╰────────────────────────────────────────────────────╯
+────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────
+  freshdir  model:Fable 5 (effort:xhigh)
+  ← for agents"""
+
+CLAUDE_TRUST_DIALOG_PANE = """\
+────────────────────────────────────────────────────
+ Accessing workspace:
+
+ /tmp/scratch/freshdir
+
+ Quick safety check: Is this a project you created or one you trust? (Like your own code, a well-known open source project, or work from
+ your team). If not, take a moment to review what's in this folder first.
+
+ Claude Code'll be able to read, edit, and execute files here.
+
+ Security guide
+
+ ❯ 1. Yes, I trust this folder
+   2. No, exit
+
+ Enter to confirm · Esc to cancel"""
+
+CLAUDE_WRITE_DIALOG_PANE = """\
+❯ Create a file named hello.txt containing the word hi, using the Write tool.
+
+⏺ Write(hello.txt)
+
+────────────────────────────────────────────────────
+ Create file
+ hello.txt
+╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
+  1 hi
+╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
+ Do you want to create hello.txt?
+ ❯ 1. Yes
+   2. Yes, allow all edits during this session (shift+tab)
+   3. No
+
+ Esc to cancel · Tab to amend"""
+
+CLAUDE_BASH_DIALOG_PANE = """\
+⏺ Bash(node -e "console.log(1)")
+  ⎿  Waiting…
+
+────────────────────────────────────────────────────
+ Bash command
+
+   node -e "console.log(1)"
+   Run Node one-liner printing 1
+
+ This command requires approval
+
+ Do you want to proceed?
+ ❯ 1. Yes
+   2. Yes, and don’t ask again for: node *
+   3. No
+
+ Esc to cancel · Tab to amend · ctrl+e to explain"""
+
+CODEX_TRUST_DIALOG_PANE = """\
+> You are in /tmp/scratch/codex-cap
+
+  Do you trust the contents of this directory? Working with untrusted contents comes with higher risk of prompt injection.
+
+› 1. Yes, continue
+  2. No, quit
+
+  Press enter to continue"""
 
 
 class FakeTmux:
@@ -332,6 +413,80 @@ def test_active_bridge_routes_plain_message_to_tmux(tmp_path: Path, monkeypatch)
     assert fake_tmux.submit_keys == [(session_name, ["Escape", "Enter"])]
 
 
+def test_exit_detaches_current_session_without_stopping_tmux(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    fake_tmux = FakeTmux()
+    replies: list[str] = []
+    plugin = _plugin(fake_tmux, replies, tmp_path)
+    monkeypatch.chdir(tmp_path)
+    plugin.handle_pre_gateway_dispatch(event=_event("/codex init"), gateway=_gateway())
+    session_name = str(fake_tmux.started[0]["session_name"])
+
+    result = plugin.handle_pre_gateway_dispatch(
+        event=_event("/codex exit"),
+        gateway=_gateway(),
+    )
+
+    assert result == {"action": "skip", "reason": "cli-bridge-control"}
+    assert fake_tmux.stopped == []
+    assert replies[-1] == "[codex:default] exited bridge; session is still running."
+
+    result = plugin.handle_pre_gateway_dispatch(
+        event=_event("this should go to Hermes"),
+        gateway=_gateway(),
+    )
+    assert result is None
+    assert fake_tmux.inputs == []
+
+    plugin.handle_pre_gateway_dispatch(event=_event("/codex select default"), gateway=_gateway())
+    plugin.handle_pre_gateway_dispatch(event=_event("back to codex"), gateway=_gateway())
+    assert fake_tmux.inputs == [(session_name, "back to codex")]
+
+
+def test_select_none_detaches_single_session_without_stopping_tmux(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    fake_tmux = FakeTmux()
+    replies: list[str] = []
+    plugin = _plugin(fake_tmux, replies, tmp_path)
+    monkeypatch.chdir(tmp_path)
+    plugin.handle_pre_gateway_dispatch(event=_event("/codex init"), gateway=_gateway())
+
+    plugin.handle_pre_gateway_dispatch(event=_event("/codex select none"), gateway=_gateway())
+    result = plugin.handle_pre_gateway_dispatch(
+        event=_event("this should also go to Hermes"),
+        gateway=_gateway(),
+    )
+
+    assert result is None
+    assert fake_tmux.inputs == []
+    assert fake_tmux.stopped == []
+
+
+def test_claude_exit_detaches_current_session_without_stopping_tmux(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    fake_tmux = FakeTmux()
+    fake_tmux.capture_text = CLAUDE_READY_PANE
+    replies: list[str] = []
+    plugin = _plugin(fake_tmux, replies, tmp_path)
+    monkeypatch.chdir(tmp_path)
+    plugin.handle_pre_gateway_dispatch(event=_event("/claude init"), gateway=_gateway())
+
+    result = plugin.handle_pre_gateway_dispatch(
+        event=_event("/claude exit"),
+        gateway=_gateway(),
+    )
+
+    assert result == {"action": "skip", "reason": "cli-bridge-control"}
+    assert fake_tmux.stopped == []
+    assert replies[-1] == "[claude:default] exited bridge; session is still running."
+
+
 def test_active_bridge_routes_media_only_message_to_tmux(tmp_path: Path, monkeypatch) -> None:
     fake_tmux = FakeTmux()
     replies: list[str] = []
@@ -365,8 +520,8 @@ def test_active_bridge_routes_caption_with_media_to_tmux(
     plugin.handle_pre_gateway_dispatch(event=_event("/codex init"), gateway=_gateway())
     session_name = str(fake_tmux.started[0]["session_name"])
     event = _event("look at this")
-    event.media_urls = ["/tmp/hermes-voice.ogg"]
-    event.media_types = ["audio/ogg"]
+    event.media_urls = ["/tmp/hermes-report.pdf"]
+    event.media_types = ["application/pdf"]
 
     result = plugin.handle_pre_gateway_dispatch(
         event=event,
@@ -377,9 +532,162 @@ def test_active_bridge_routes_caption_with_media_to_tmux(
     assert fake_tmux.inputs == [
         (
             session_name,
-            "look at this\n\nUser attached file(s):\n- audio/ogg: /tmp/hermes-voice.ogg",
+            "look at this\n\nUser attached file(s):\n- application/pdf: /tmp/hermes-report.pdf",
         )
     ]
+
+
+def test_tmux_backend_transcribes_voice_memo_before_send(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    fake_tmux = FakeTmux()
+    fake_tmux.capture_text = CLAUDE_READY_PANE
+    replies: list[str] = []
+
+    class Gateway:
+        adapters = {}
+
+        def _is_user_authorized(self, _source) -> bool:
+            return True
+
+        async def _enrich_message_with_transcription(self, text, audio_paths):
+            assert text == "caption"
+            assert audio_paths == ["/tmp/hermes-voice.ogg"]
+            return '"hello from voice"\n\ncaption', ["hello from voice"]
+
+    plugin = _plugin(fake_tmux, replies, tmp_path)
+    monkeypatch.chdir(tmp_path)
+    plugin.handle_pre_gateway_dispatch(event=_event("/claude init"), gateway=Gateway())
+    session_name = str(fake_tmux.started[0]["session_name"])
+    event = _event("caption")
+    event.message_type = MessageType.VOICE
+    event.media_urls = ["/tmp/hermes-voice.ogg"]
+    event.media_types = ["audio/ogg"]
+
+    result = plugin.handle_pre_gateway_dispatch(event=event, gateway=Gateway())
+
+    deadline = time.time() + 2
+    while time.time() < deadline and not fake_tmux.inputs:
+        time.sleep(0.01)
+
+    assert result == {"action": "skip", "reason": "cli-bridge-input"}
+    assert fake_tmux.inputs == [(session_name, '"hello from voice"\n\ncaption')]
+    assert fake_tmux.submit_keys[-1] == (session_name, ["Enter"])
+
+
+def test_tmux_text_after_voice_memo_keeps_arrival_order(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    fake_tmux = FakeTmux()
+    fake_tmux.capture_text = CLAUDE_READY_PANE
+    replies: list[str] = []
+
+    class Gateway:
+        adapters = {}
+
+        def _is_user_authorized(self, _source) -> bool:
+            return True
+
+        async def _enrich_message_with_transcription(self, text, audio_paths):
+            await asyncio.sleep(0.2)
+            return '"voice first"', ["voice first"]
+
+    plugin = _plugin(fake_tmux, replies, tmp_path)
+    monkeypatch.chdir(tmp_path)
+    plugin.handle_pre_gateway_dispatch(event=_event("/claude init"), gateway=Gateway())
+    session_name = str(fake_tmux.started[0]["session_name"])
+
+    voice_event = _event("")
+    voice_event.message_type = MessageType.VOICE
+    voice_event.media_urls = ["/tmp/hermes-voice.ogg"]
+    voice_event.media_types = ["audio/ogg"]
+    plugin.handle_pre_gateway_dispatch(event=voice_event, gateway=Gateway())
+    plugin.handle_pre_gateway_dispatch(event=_event("text second"), gateway=Gateway())
+
+    deadline = time.time() + 3
+    while time.time() < deadline and len(fake_tmux.inputs) < 2:
+        time.sleep(0.01)
+
+    assert fake_tmux.inputs == [
+        (session_name, '"voice first"'),
+        (session_name, "text second"),
+    ]
+
+
+def test_tmux_send_deferred_while_approval_pending(tmp_path: Path, monkeypatch) -> None:
+    fake_tmux = FakeTmux()
+    fake_tmux.capture_text = CLAUDE_READY_PANE
+    replies: list[str] = []
+    plugin = _plugin(fake_tmux, replies, tmp_path)
+    monkeypatch.chdir(tmp_path)
+    plugin.handle_pre_gateway_dispatch(event=_event("/claude init"), gateway=_gateway())
+    session = next(iter(plugin._sessions.values()))
+    session.approval_signature = "pending-dialog"
+
+    result = plugin.handle_pre_gateway_dispatch(
+        event=_event("do not type into the dialog"),
+        gateway=_gateway(),
+    )
+
+    assert result == {"action": "skip", "reason": "cli-bridge-input"}
+    time.sleep(0.1)
+    assert fake_tmux.inputs == []
+
+    session.approval_signature = None
+    deadline = time.time() + 3
+    while time.time() < deadline and not fake_tmux.inputs:
+        time.sleep(0.01)
+    assert fake_tmux.inputs == [
+        (str(fake_tmux.started[0]["session_name"]), "do not type into the dialog")
+    ]
+
+
+def test_exec_lock_released_when_worker_thread_fails_to_start(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    fake_tmux = FakeTmux()
+    replies: list[str] = []
+    plugin = _plugin(fake_tmux, replies, tmp_path)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("HERMES_CLI_BRIDGE_CODEX_BACKEND", "exec")
+    plugin.handle_pre_gateway_dispatch(event=_event("/codex init"), gateway=_gateway())
+    session = next(iter(plugin._sessions.values()))
+
+    def _boom(self):
+        raise RuntimeError("can't start new thread")
+
+    monkeypatch.setattr("hermes_cli_bridge.bridge.threading.Thread.start", _boom)
+    plugin.handle_pre_gateway_dispatch(event=_event("hello"), gateway=_gateway())
+    monkeypatch.undo()
+
+    assert session.exec_lock.acquire(blocking=False)
+    session.exec_lock.release()
+
+
+def test_exec_reply_discarded_after_kill(tmp_path: Path, monkeypatch) -> None:
+    fake_tmux = FakeTmux()
+    replies: list[str] = []
+    release = threading.Event()
+
+    def _runner(args, **kwargs):
+        release.wait(timeout=5)
+        stdout = '{"type":"result","result":"GHOST","session_id":"sess-ghost"}'
+        return subprocess.CompletedProcess(args=args, returncode=0, stdout=stdout, stderr="")
+
+    plugin = _plugin(fake_tmux, replies, tmp_path, exec_runner=_runner)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("HERMES_CLI_BRIDGE_CLAUDE_BACKEND", "exec")
+    plugin.handle_pre_gateway_dispatch(event=_event("/claude init"), gateway=_gateway())
+    plugin.handle_pre_gateway_dispatch(event=_event("hello"), gateway=_gateway())
+
+    plugin.handle_pre_gateway_dispatch(event=_event("/claude kill"), gateway=_gateway())
+    release.set()
+
+    time.sleep(0.3)
+    assert not any("GHOST" in reply for reply in replies)
 
 
 def test_active_bridge_sends_typing_indicator(tmp_path: Path, monkeypatch) -> None:
@@ -485,6 +793,7 @@ def test_send_subcommand_can_forward_cli_slash_command(tmp_path: Path, monkeypat
 
 def test_claude_init_starts_tmux_with_claude_command(tmp_path: Path, monkeypatch) -> None:
     fake_tmux = FakeTmux()
+    fake_tmux.capture_text = CLAUDE_READY_PANE
     replies: list[str] = []
     plugin = _plugin(fake_tmux, replies, tmp_path)
     monkeypatch.chdir(tmp_path)
@@ -503,6 +812,7 @@ def test_claude_init_starts_tmux_with_claude_command(tmp_path: Path, monkeypatch
 
 def test_claude_tmux_uses_plain_enter_submit(tmp_path: Path, monkeypatch) -> None:
     fake_tmux = FakeTmux()
+    fake_tmux.capture_text = CLAUDE_READY_PANE
     replies: list[str] = []
     plugin = _plugin(fake_tmux, replies, tmp_path)
     monkeypatch.chdir(tmp_path)
@@ -513,6 +823,62 @@ def test_claude_tmux_uses_plain_enter_submit(tmp_path: Path, monkeypatch) -> Non
 
     assert fake_tmux.inputs[-1] == (session_name, "hello")
     assert fake_tmux.submit_keys[-1] == (session_name, ["Enter"])
+
+
+def test_claude_init_waits_for_claude_prompt(tmp_path: Path, monkeypatch) -> None:
+    fake_tmux = FakeTmux()
+    fake_tmux.captures = [
+        "",
+        CLAUDE_READY_PANE,
+    ]
+    replies: list[str] = []
+    plugin = _plugin(fake_tmux, replies, tmp_path)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr("hermes_cli_bridge.bridge.time.sleep", lambda _seconds: None)
+
+    result = plugin.handle_pre_gateway_dispatch(
+        event=_event("/claude init"),
+        gateway=_gateway(),
+    )
+
+    assert result == {"action": "skip", "reason": "cli-bridge-control"}
+    assert len(fake_tmux.capture_calls) == 2
+    assert replies[-1].startswith("[claude:default] started in")
+
+
+def test_claude_tmux_ready_detection_rejects_foreign_panes(tmp_path: Path) -> None:
+    plugin = CliBridgePlugin(enable_output_reader=False, state_dir=tmp_path)
+
+    assert not plugin._tmux_snapshot_ready("claude", "")
+    assert not plugin._tmux_snapshot_ready(
+        "claude",
+        "OpenAI Codex\nmodel: gpt-5.5\n› Explain this codebase",
+    )
+    assert not plugin._tmux_snapshot_ready("claude", CLAUDE_TRUST_DIALOG_PANE)
+    assert plugin._tmux_snapshot_ready("claude", CLAUDE_READY_PANE)
+
+
+def test_init_treats_startup_trust_dialog_as_ready(tmp_path: Path, monkeypatch) -> None:
+    for agent, pane in (
+        ("claude", CLAUDE_TRUST_DIALOG_PANE),
+        ("codex", CODEX_TRUST_DIALOG_PANE),
+    ):
+        fake_tmux = FakeTmux()
+        fake_tmux.captures = [pane]
+        fake_tmux.capture_text = pane
+        replies: list[str] = []
+        plugin = _plugin(fake_tmux, replies, tmp_path)
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setattr("hermes_cli_bridge.bridge.time.sleep", lambda _seconds: None)
+
+        result = plugin.handle_pre_gateway_dispatch(
+            event=_event(f"/{agent} init"),
+            gateway=_gateway(),
+        )
+
+        assert result == {"action": "skip", "reason": "cli-bridge-control"}
+        assert len(fake_tmux.capture_calls) == 1
+        assert replies[-1].startswith(f"[{agent}:default] started in")
 
 
 def test_codex_submit_keys_can_be_overridden(tmp_path: Path, monkeypatch) -> None:
@@ -970,18 +1336,36 @@ def test_tmux_send_input_pastes_multiline_payload_once() -> None:
         submit_keys=["Escape", "Enter"],
     )
 
+    buffer_name = calls[0][0][3]
+    assert buffer_name.startswith("hermes-codex-test-input-")
     assert calls == [
         (
-            ["tmux", "load-buffer", "-b", "hermes-codex-test-input", "-"],
+            ["tmux", "load-buffer", "-b", buffer_name, "-"],
             "look\n- image/jpeg: /tmp/a.jpg",
         ),
         (
-            ["tmux", "paste-buffer", "-d", "-b", "hermes-codex-test-input", "-t", "hermes-codex-test"],
+            ["tmux", "paste-buffer", "-d", "-b", buffer_name, "-t", "hermes-codex-test"],
             None,
         ),
         (["tmux", "send-keys", "-t", "hermes-codex-test", "Escape"], None),
         (["tmux", "send-keys", "-t", "hermes-codex-test", "Enter"], None),
     ]
+
+
+def test_tmux_send_input_uses_unique_buffer_per_call() -> None:
+    calls: list[list[str]] = []
+
+    def _runner(args, **kwargs):
+        calls.append(args)
+        return subprocess.CompletedProcess(args=args, returncode=0, stdout="", stderr="")
+
+    client = TmuxClient(runner=_runner)
+    client.send_input("hermes-codex-test", "a\nb")
+    client.send_input("hermes-codex-test", "c\nd")
+
+    buffer_names = [args[3] for args in calls if args[1] == "load-buffer"]
+    assert len(buffer_names) == 2
+    assert buffer_names[0] != buffer_names[1]
 
 
 def test_clean_output_strips_osc_ansi_and_control_sequences(tmp_path: Path) -> None:
@@ -1142,3 +1526,377 @@ def test_log_snippet_caps_and_escapes_newlines(tmp_path: Path, monkeypatch) -> N
     plugin = CliBridgePlugin(enable_output_reader=False, state_dir=tmp_path)
 
     assert plugin._log_snippet("abcdefghij\nnext") == "abcdefgh..."
+
+
+def test_claude_transcript_extracts_assistant_reply(tmp_path: Path) -> None:
+    plugin = CliBridgePlugin(enable_output_reader=False, state_dir=tmp_path)
+    snapshot = """\
+╭─── Claude Code v2.1.201 ──────────────────────────╮
+│                 Welcome back Alex!                 │
+╰────────────────────────────────────────────────────╯
+❯ What is 2+2? Answer with only the number.
+
+⏺ 4
+
+✻ Cogitated for 2s
+
+────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────
+  freshdir  dur:5s  tok/s:8072.6  ctx:4%  model:Fable 5 (effort:xhigh)
+  ← for agents"""
+
+    assert plugin._assistant_transcript_from_capture(snapshot, agent="claude") == "4"
+
+
+def test_claude_transcript_includes_tool_calls_and_results(tmp_path: Path) -> None:
+    plugin = CliBridgePlugin(enable_output_reader=False, state_dir=tmp_path)
+    snapshot = """\
+❯ Run the shell command: node -e "console.log(1)" and tell me the output
+
+⏺ Bash(node -e "console.log(1)")
+  ⎿  1
+
+⏺ The output is 1.
+
+✻ Baked for 5s
+
+────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────
+  freshdir  model:Fable 5 (effort:xhigh)"""
+
+    assert plugin._assistant_transcript_from_capture(snapshot, agent="claude") == (
+        'Bash(node -e "console.log(1)")\n⎿  1\n\nThe output is 1.'
+    )
+
+
+def test_claude_transcript_ignores_spinner_and_ghost_text(tmp_path: Path) -> None:
+    plugin = CliBridgePlugin(enable_output_reader=False, state_dir=tmp_path)
+    snapshot = """\
+❯ Write a 200 word essay about clouds.
+
+✢ Garnishing… (2s · ↓ 65 tokens)
+
+────────────────────────────────────────────────────
+❯ cat hello.txt
+────────────────────────────────────────────────────
+  freshdir  model:Fable 5 (effort:xhigh)
+                                      tmux focus-events off · add 'set -g focus-events on' to ~/.tmux.conf and reattach for focus tracking"""
+
+    assert plugin._assistant_transcript_from_capture(snapshot, agent="claude") == ""
+
+
+def test_claude_status_line_detection(tmp_path: Path) -> None:
+    plugin = CliBridgePlugin(enable_output_reader=False, state_dir=tmp_path)
+
+    for status in (
+        "✻ Puzzling…",
+        "✢ Ideating…",
+        "✢ Garnishing… (2s · ↓ 65 tokens)",
+        "✽ Ideating… (running stop hooks… 0/2 · 9s · ↓ 174 tokens)",
+        "✻ Cogitated for 2s",
+        "⎿  Waiting…",
+    ):
+        assert plugin._is_capture_status_line(status, agent="claude"), status
+
+    for prose in (
+        "⏺ Puzzling as it sounds, yes.",
+        "⏺ Working with Hermes slash commands requires explicit forwarding.",
+        "The essay took 2s to write.",
+    ):
+        assert not plugin._is_capture_status_line(prose, agent="claude"), prose
+
+
+def test_claude_transcript_delta_suppresses_turn_summary_updates(tmp_path: Path) -> None:
+    plugin = CliBridgePlugin(enable_output_reader=False, state_dir=tmp_path)
+    before = "Bash(touch hello.txt)\n⎿  (No content)\n✻ Worked for 6s"
+    after = "Bash(touch hello.txt)\n⎿  (No content)\n✻ Worked for 9s"
+
+    assert plugin._transcript_delta(before, after, agent="claude") == ""
+
+
+def test_claude_tmux_detects_permission_dialogs(tmp_path: Path) -> None:
+    plugin = CliBridgePlugin(enable_output_reader=False, state_dir=tmp_path)
+    session = SimpleNamespace(agent="claude")
+
+    write_approval = plugin._approval_from_capture(session, CLAUDE_WRITE_DIALOG_PANE)
+    assert write_approval is not None
+    assert "Do you want to create hello.txt?" in write_approval["preview"]
+    assert write_approval["signature"]
+
+    bash_approval = plugin._approval_from_capture(session, CLAUDE_BASH_DIALOG_PANE)
+    assert bash_approval is not None
+    assert "Do you want to proceed?" in bash_approval["preview"]
+
+    trust_approval = plugin._approval_from_capture(session, CLAUDE_TRUST_DIALOG_PANE)
+    assert trust_approval is not None
+    assert "Yes, I trust this folder" in trust_approval["preview"]
+
+
+def test_claude_prose_question_is_not_an_approval(tmp_path: Path) -> None:
+    plugin = CliBridgePlugin(enable_output_reader=False, state_dir=tmp_path)
+    session = SimpleNamespace(agent="claude")
+
+    snapshot = """\
+⏺ Do you want to proceed with plan A or plan B?
+  Reply with 1. yes to plan A or 2. yes to plan B.
+
+────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────"""
+
+    assert plugin._approval_from_capture(session, snapshot) is None
+
+
+def test_claude_tmux_approval_choice_maps_to_number_keys(tmp_path: Path) -> None:
+    fake_tmux = FakeTmux()
+    plugin = CliBridgePlugin(
+        tmux=fake_tmux,  # type: ignore[arg-type]
+        enable_output_reader=False,
+        state_dir=tmp_path,
+    )
+    session = SimpleNamespace(agent="claude", session_name="hermes-claude-test")
+
+    plugin._send_tmux_approval_choice(session, "once")
+    plugin._send_tmux_approval_choice(
+        session,
+        "session",
+        preview="2. Yes, allow all edits during this session (shift+tab)",
+    )
+    plugin._send_tmux_approval_choice(
+        session,
+        "always",
+        preview="2. Yes, and don’t ask again for: node *",
+    )
+    plugin._send_tmux_approval_choice(
+        session,
+        "session",
+        preview="❯ 1. Yes, I trust this folder\n  2. No, exit",
+    )
+    plugin._send_tmux_approval_choice(session, "deny")
+
+    assert fake_tmux.keys == [
+        ("hermes-claude-test", ["1"]),
+        ("hermes-claude-test", ["2"]),
+        ("hermes-claude-test", ["2"]),
+        ("hermes-claude-test", ["1"]),
+        ("hermes-claude-test", ["Escape"]),
+    ]
+
+
+def test_codex_trust_prompt_choice_maps_to_enter_and_escape(tmp_path: Path) -> None:
+    fake_tmux = FakeTmux()
+    plugin = CliBridgePlugin(
+        tmux=fake_tmux,  # type: ignore[arg-type]
+        enable_output_reader=False,
+        state_dir=tmp_path,
+    )
+    session = SimpleNamespace(agent="codex", session_name="hermes-codex-test")
+
+    plugin._send_tmux_approval_choice(session, "once", preview=CODEX_TRUST_DIALOG_PANE)
+    plugin._send_tmux_approval_choice(session, "deny", preview=CODEX_TRUST_DIALOG_PANE)
+
+    assert fake_tmux.keys == [
+        ("hermes-codex-test", ["Enter"]),
+        ("hermes-codex-test", ["Escape"]),
+    ]
+
+
+def test_claude_tmux_approval_uses_claude_labels(tmp_path: Path, monkeypatch) -> None:
+    class Adapter:
+        typed_command_prefix = "/"
+
+        def __init__(self) -> None:
+            self.requests: list[dict[str, object]] = []
+
+        def send_exec_approval(self, **kwargs):
+            self.requests.append(kwargs)
+            return SimpleNamespace(success=True)
+
+    def _await_gateway_decision(session_key, notify_cb, approval_data, *, surface):
+        notify_cb(approval_data)
+        assert approval_data["pattern_key"] == "claude tmux approval"
+        assert surface == "cli_bridge_tmux"
+        return {"resolved": True, "choice": "once"}
+
+    import tools.approval as approval_mod
+
+    monkeypatch.setattr(approval_mod, "_await_gateway_decision", _await_gateway_decision)
+    adapter = Adapter()
+    gateway = SimpleNamespace(
+        adapters={Platform.TELEGRAM: adapter},
+        _session_key_for_source=lambda _source: "telegram:chat1:u1",
+    )
+    plugin = CliBridgePlugin(enable_output_reader=False, state_dir=tmp_path)
+    session = SimpleNamespace(
+        agent="claude",
+        key="fallback-key",
+        cwd=tmp_path,
+        session_name="hermes-claude-test",
+    )
+
+    choice = plugin._request_tmux_approval_decision(
+        session,
+        gateway,
+        _event(""),
+        "Do you want to create hello.txt?",
+    )
+
+    assert choice == "once"
+    assert adapter.requests[0]["command"].startswith("Claude tmux approval in")
+    assert "Do you want to create hello.txt?" in adapter.requests[0]["command"]
+    assert adapter.requests[0]["description"] == (
+        "Claude is waiting for permission in the tmux bridge."
+    )
+
+
+def test_claude_exec_backend_init_does_not_start_tmux(tmp_path: Path, monkeypatch) -> None:
+    fake_tmux = FakeTmux()
+    replies: list[str] = []
+    plugin = _plugin(fake_tmux, replies, tmp_path)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("HERMES_CLI_BRIDGE_CLAUDE_BACKEND", "exec")
+
+    result = plugin.handle_pre_gateway_dispatch(
+        event=_event("/claude init"),
+        gateway=_gateway(),
+    )
+
+    assert result == {"action": "skip", "reason": "cli-bridge-control"}
+    assert fake_tmux.started == []
+    assert replies[-1].startswith("[claude:default] started in")
+    assert "\nexec: hermes-claude-exec-" in replies[-1]
+
+
+def test_claude_exec_backend_routes_subprocess_output(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    fake_tmux = FakeTmux()
+    replies: list[str] = []
+    commands: list[list[str]] = []
+
+    def _runner(args, **kwargs):
+        commands.append(list(args))
+        stdout = (
+            '{"type":"result","subtype":"success","is_error":false,'
+            '"result":"CLAUDE_OK","session_id":"sess-1","total_cost_usd":0.01}'
+        )
+        return subprocess.CompletedProcess(args=args, returncode=0, stdout=stdout, stderr="")
+
+    plugin = _plugin(fake_tmux, replies, tmp_path, exec_runner=_runner)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("HERMES_CLI_BRIDGE_CLAUDE_BACKEND", "exec")
+    plugin.handle_pre_gateway_dispatch(event=_event("/claude init"), gateway=_gateway())
+
+    result = plugin.handle_pre_gateway_dispatch(
+        event=_event("hello"),
+        gateway=_gateway(),
+    )
+
+    deadline = time.time() + 1
+    while time.time() < deadline and "[claude]\nCLAUDE_OK" not in replies:
+        time.sleep(0.01)
+
+    assert result == {"action": "skip", "reason": "cli-bridge-input"}
+    assert fake_tmux.inputs == []
+    assert "[claude]\nCLAUDE_OK" in replies
+    assert commands[0] == ["claude", "--print", "--output-format", "json"]
+    session = next(iter(plugin._sessions.values()))
+    assert session.thread_id == "sess-1"
+
+    plugin.handle_pre_gateway_dispatch(event=_event("again"), gateway=_gateway())
+    deadline = time.time() + 1
+    while time.time() < deadline and len(commands) < 2:
+        time.sleep(0.01)
+
+    assert commands[1] == [
+        "claude",
+        "--print",
+        "--output-format",
+        "json",
+        "--resume",
+        "sess-1",
+    ]
+
+
+def test_claude_exec_command_derives_from_tui_command(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv(
+        "HERMES_CLI_BRIDGE_CLAUDE_CMD",
+        "claude --model claude-opus-4-8 -p",
+    )
+    plugin = CliBridgePlugin(enable_output_reader=False, state_dir=tmp_path)
+    session = SimpleNamespace(thread_id=None)
+
+    command = plugin._claude_exec_command(session, tmp_path / "last.txt")
+
+    assert command == [
+        "claude",
+        "--model",
+        "claude-opus-4-8",
+        "--print",
+        "--output-format",
+        "json",
+    ]
+
+
+def test_parse_claude_exec_stdout(tmp_path: Path) -> None:
+    plugin = CliBridgePlugin(enable_output_reader=False, state_dir=tmp_path)
+
+    session_id, message = plugin._parse_claude_exec_stdout(
+        '{"type":"result","subtype":"success","is_error":false,'
+        '"result":"done","session_id":"abc"}'
+    )
+    assert session_id == "abc"
+    assert message == "done"
+
+    session_id, message = plugin._parse_claude_exec_stdout(
+        'npm warn something\n{"type":"result","result":"ok","session_id":"xyz"}\n'
+    )
+    assert session_id == "xyz"
+    assert message == "ok"
+
+
+def test_claude_exec_backend_transcribes_voice_before_prompt(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    fake_tmux = FakeTmux()
+    replies: list[str] = []
+    received_inputs: list[str] = []
+
+    def _runner(args, **kwargs):
+        received_inputs.append(kwargs["input"])
+        stdout = '{"type":"result","result":"VOICE_OK","session_id":"sess-voice"}'
+        return subprocess.CompletedProcess(args=args, returncode=0, stdout=stdout, stderr="")
+
+    class Gateway:
+        adapters = {}
+
+        def _is_user_authorized(self, _source) -> bool:
+            return True
+
+        async def _enrich_message_with_transcription(self, text, audio_paths):
+            assert text == "caption"
+            assert audio_paths == ["/tmp/hermes-voice.ogg"]
+            return '"hello from voice"\n\ncaption', ["hello from voice"]
+
+    plugin = _plugin(fake_tmux, replies, tmp_path, exec_runner=_runner)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("HERMES_CLI_BRIDGE_CLAUDE_BACKEND", "exec")
+    plugin.handle_pre_gateway_dispatch(event=_event("/claude init"), gateway=Gateway())
+    event = _event("caption")
+    event.message_type = MessageType.VOICE
+    event.media_urls = ["/tmp/hermes-voice.ogg"]
+    event.media_types = ["audio/ogg"]
+
+    result = plugin.handle_pre_gateway_dispatch(event=event, gateway=Gateway())
+
+    deadline = time.time() + 1
+    while time.time() < deadline and not received_inputs:
+        time.sleep(0.01)
+
+    assert result == {"action": "skip", "reason": "cli-bridge-input"}
+    assert received_inputs == ['"hello from voice"\n\ncaption']
+    assert "[claude]\nVOICE_OK" in replies

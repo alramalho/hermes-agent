@@ -22,6 +22,7 @@ The host must have `tmux` and the target CLI installed and authenticated.
 /codex rename <new-name>          Rename the current bridge session.
 /codex send <text>                Send text exactly, including CLI slash commands.
 /codex status [name|current]      Show session status.
+/codex exit                       Exit the current bridge without killing it.
 /codex kill [name|current]        Kill a session. `/codex end` aliases this.
 
 /claude init [name] [--cwd <cwd>]
@@ -30,6 +31,7 @@ The host must have `tmux` and the target CLI installed and authenticated.
 /claude rename <new-name>
 /claude send <text>
 /claude status [name|current]
+/claude exit
 /claude kill [name|current]
 ```
 
@@ -69,6 +71,8 @@ HERMES_CLI_BRIDGE_CODEX_CMD=codex
 HERMES_CLI_BRIDGE_CODEX_BACKEND=tmux
 HERMES_CLI_BRIDGE_CODEX_EXEC_CMD=codex exec
 HERMES_CLI_BRIDGE_CLAUDE_CMD=claude
+HERMES_CLI_BRIDGE_CLAUDE_BACKEND=tmux
+HERMES_CLI_BRIDGE_CLAUDE_EXEC_CMD=claude
 HERMES_CLI_BRIDGE_OUTPUT_INTERVAL=1.0
 HERMES_CLI_BRIDGE_CHUNK_CHARS=3500
 HERMES_CLI_BRIDGE_MAX_OUTPUT_CHARS=12000
@@ -97,20 +101,29 @@ HERMES_CLI_BRIDGE_CODEX_CMD=codex --model gpt-5.5 --no-alt-screen -c check_for_u
 
 Codex tmux submission defaults to `Escape,Enter`. That normalizes the composer
 state before submitting and works across Codex terminal modes that otherwise
-treat a lone `Enter` or `C-m` as an inserted newline. Override with
-`HERMES_CLI_BRIDGE_CODEX_SUBMIT_KEYS` or the generic
-`HERMES_CLI_BRIDGE_TMUX_SUBMIT_KEYS` when a target CLI needs different keys.
+treat a lone `Enter` or `C-m` as an inserted newline. Claude Code submits with
+a plain `Enter` (an `Escape` there would clear the composer or interrupt a
+running turn). Override with `HERMES_CLI_BRIDGE_<AGENT>_SUBMIT_KEYS` or the
+generic `HERMES_CLI_BRIDGE_TMUX_SUBMIT_KEYS` when a target CLI needs different
+keys.
 `HERMES_CLI_BRIDGE_TMUX_KEY_DELAY` adds a small pause between keys so terminal
 UIs can process mode changes such as `Escape` before the submit key arrives.
 `HERMES_CLI_BRIDGE_STARTUP_READY_TIMEOUT` makes `/codex init` wait for the
 initial Codex prompt to be ready, so the next Telegram message is not typed
 while the TUI is still loading.
 
-When the Codex tmux UI asks for permission, the bridge reuses Hermes' existing
-Telegram approval buttons. `Allow Once` sends `y`; `Session` and `Always` send
-the key shown by Codex's "don't ask again" option, such as `a` for file edits
-or `p` for command-pattern approvals; `Deny` sends `Escape` back to the tmux
-pane.
+When the Codex or Claude tmux UI asks for permission, the bridge reuses Hermes'
+existing Telegram approval buttons. For Codex, `Allow Once` sends `y`; `Session`
+and `Always` send the key shown by Codex's "don't ask again" option, such as `a`
+for file edits or `p` for command-pattern approvals. For Claude Code, `Allow
+Once` presses `1` and `Session`/`Always` press `2` when the dialog offers a
+persistent "Yes, …" option (falling back to `1` when it does not, e.g. the
+folder-trust dialog). `Deny` sends `Escape` back to the tmux pane for both.
+
+First-run trust prompts ("Do you trust the contents of this directory?" for
+Codex, the "Quick safety check" workspace prompt for Claude) are surfaced
+through the same approval buttons, so `/codex init` and `/claude init` in a new
+directory no longer hang until the startup timeout.
 
 Set `HERMES_CLI_BRIDGE_CODEX_BACKEND=exec` to route Codex prompts through
 `codex exec` / `codex exec resume` instead of the interactive TUI. This is more
@@ -119,9 +132,18 @@ submit the composer. `HERMES_CLI_BRIDGE_CODEX_CMD` is reused for model/config
 flags; TUI-only flags such as `--no-alt-screen` are ignored for exec calls. Set
 `HERMES_CLI_BRIDGE_CODEX_EXEC_CMD` if you want to provide the exact exec command.
 
-For exec-backed Codex sessions, Telegram voice messages are transcribed through
-Hermes's normal STT pipeline before the prompt is sent to Codex. Uploaded audio
-files remain attachment path notes so Codex can decide how to process them.
+Set `HERMES_CLI_BRIDGE_CLAUDE_BACKEND=exec` for the Claude equivalent: prompts
+run through `claude --print --output-format json`, threads continue via
+`--resume <session-id>`, and the reply text comes from the JSON `result` field.
+`HERMES_CLI_BRIDGE_CLAUDE_CMD` is reused for flags (`-p`/`--print`/`--continue`
+are stripped); set `HERMES_CLI_BRIDGE_CLAUDE_EXEC_CMD` to override the exact
+command.
+
+Telegram voice messages are transcribed through Hermes's normal STT pipeline
+before the prompt is sent to the CLI — on the exec backends and on tmux
+sessions alike (tmux voice sends happen on a worker thread so the gateway loop
+is never blocked). Uploaded audio files remain attachment path notes so the CLI
+can decide how to process them.
 
 Gateway INFO logs include redacted `input='first 50 chars...'` and
 `output='first 50 chars...'` snippets. The JSONL audit log keeps capped, redacted
