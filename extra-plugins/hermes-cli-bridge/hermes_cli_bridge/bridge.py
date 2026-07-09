@@ -321,7 +321,7 @@ class CliBridgePlugin:
         gateway: Any = None,
         session_store: Any = None,
         **_: Any,
-    ) -> dict[str, str] | None:
+    ) -> dict[str, Any] | None:
         if event is None or gateway is None or getattr(event, "internal", False):
             return None
 
@@ -486,23 +486,16 @@ class CliBridgePlugin:
 
         invocation = self._parse_receiver_invocation(text)
         if invocation is None:
-            self._delete_fresh_telegram_topic(event, gateway)
-            return {"action": "skip", "reason": "cli-bridge-receiver"}
+            return self._reroute_fresh_telegram_topic_to_main(text, event, gateway)
 
         agent, rest = invocation
         if agent == "hermes":
             if not rest:
-                self._delete_fresh_telegram_topic(event, gateway)
-                return {"action": "skip", "reason": "cli-bridge-receiver"}
-            return {
-                "action": "rewrite",
-                "text": rest,
-                "reason": "cli-bridge-receiver-hermes",
-            }
+                return self._reroute_fresh_telegram_topic_to_main(text, event, gateway)
+            return self._reroute_fresh_telegram_topic_to_main(rest, event, gateway)
 
         if not rest:
-            self._delete_fresh_telegram_topic(event, gateway)
-            return {"action": "skip", "reason": "cli-bridge-receiver"}
+            return self._reroute_fresh_telegram_topic_to_main(text, event, gateway)
 
         if self._receiver_control_subcommand(rest) in _RECEIVER_CONTROL_SUBCOMMANDS:
             try:
@@ -574,6 +567,77 @@ class CliBridgePlugin:
         if media_note:
             parts.append(media_note)
         return "\n\n".join(parts).strip()
+
+    def _reroute_fresh_telegram_topic_to_main(
+        self,
+        text: str,
+        event: Any,
+        gateway: Any,
+    ) -> dict[str, Any]:
+        source = getattr(event, "source", None)
+        topic_name = self._receiver_topic_name()
+        thread_id = self._ensure_receiver_topic(gateway, source, topic_name)
+        if not thread_id:
+            self._delete_fresh_telegram_topic(event, gateway)
+            return {"action": "skip", "reason": "cli-bridge-receiver"}
+
+        rerouted = self._event_with_thread(event, str(thread_id), topic_name)
+        rerouted_source = dataclasses.replace(
+            getattr(rerouted, "source", None),
+            message_id=None,
+        )
+        rerouted = dataclasses.replace(
+            rerouted,
+            text=text,
+            source=rerouted_source,
+            raw_message=None,
+            message_id=None,
+            reply_to_message_id=None,
+            reply_to_text=None,
+        )
+        self._delete_fresh_telegram_topic(event, gateway)
+        return {
+            "action": "reroute",
+            "event": rerouted,
+            "reason": "cli-bridge-receiver-main",
+        }
+
+    def _receiver_topic_name(self) -> str:
+        configured = os.environ.get("HERMES_CLI_BRIDGE_TELEGRAM_RECEIVER_TOPIC", "")
+        topic_name = re.sub(r"\s+", " ", configured).strip()
+        return topic_name or "main"
+
+    def _ensure_receiver_topic(
+        self,
+        gateway: Any,
+        source: Any,
+        topic_name: str,
+    ) -> str | None:
+        chat_id = str(getattr(source, "chat_id", "") or "")
+        if not chat_id:
+            return None
+        adapter = self._adapter_for_source(gateway, source)
+        ensure_topic = getattr(adapter, "ensure_dm_topic_sync", None)
+        if not callable(ensure_topic):
+            logger.info(
+                "cli-bridge receiver cannot ensure Telegram topic %r: "
+                "adapter has no ensure_dm_topic_sync chat=%s",
+                topic_name,
+                chat_id,
+            )
+            return None
+        try:
+            thread_id = ensure_topic(chat_id, topic_name)
+        except Exception as exc:
+            logger.warning(
+                "cli-bridge receiver failed ensuring Telegram topic %r: "
+                "chat=%s error=%s",
+                topic_name,
+                chat_id,
+                exc,
+            )
+            return None
+        return str(thread_id) if thread_id else None
 
     def _delete_fresh_telegram_topic(self, event: Any, gateway: Any) -> None:
         source = getattr(event, "source", None)

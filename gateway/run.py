@@ -8418,6 +8418,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Plugins receive the MessageEvent and may return a dict influencing flow:
         #   {"action": "skip",    "reason": ...}    -> drop (no reply, plugin handled)
         #   {"action": "rewrite", "text":  ...}     -> replace event.text, continue
+        #   {"action": "reroute", "event": ...}     -> replace MessageEvent, continue
         #   {"action": "allow"}   /   None          -> normal dispatch
         # Hook runs BEFORE auth so plugins can handle unauthorized senders
         # (e.g. customer handover ingest) without triggering the pairing flow.
@@ -8451,6 +8452,27 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     if isinstance(_new_text, str):
                         event = dataclasses.replace(event, text=_new_text)
                         source = event.source
+                    break
+                if _action == "reroute":
+                    _new_event = _result.get("event")
+                    if _new_event is not None:
+                        event = _new_event
+                        source = event.source
+                    else:
+                        _replace_kwargs = {}
+                        _new_text = _result.get("text")
+                        _new_source = _result.get("source")
+                        if isinstance(_new_text, str):
+                            _replace_kwargs["text"] = _new_text
+                        if _new_source is not None:
+                            _replace_kwargs["source"] = _new_source
+                        if "message_id" in _result:
+                            _replace_kwargs["message_id"] = _result.get("message_id")
+                        if "reply_to_message_id" in _result:
+                            _replace_kwargs["reply_to_message_id"] = _result.get("reply_to_message_id")
+                        if _replace_kwargs:
+                            event = dataclasses.replace(event, **_replace_kwargs)
+                            source = event.source
                     break
                 if _action == "allow":
                     break

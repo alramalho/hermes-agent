@@ -15,6 +15,8 @@ import logging
 import os
 import html as _html
 import re
+import urllib.parse
+import urllib.request
 from datetime import datetime, timezone
 from typing import Dict, List, Optional, Set, Any
 
@@ -2448,6 +2450,123 @@ class TelegramAdapter(BasePlatformAdapter):
         self._dm_topics[cache_key] = int(thread_id)
         self._persist_dm_topic_thread_id(chat_id_int, name, int(thread_id), replace_existing=force_create)
         return str(thread_id)
+
+    def ensure_dm_topic_sync(
+        self,
+        chat_id: str,
+        topic_name: str,
+        force_create: bool = False,
+    ) -> Optional[str]:
+        """Blocking private-DM topic ensure for synchronous gateway hooks."""
+        name = str(topic_name or "").strip()
+        if not name:
+            return None
+        try:
+            chat_id_int = int(chat_id)
+        except (TypeError, ValueError):
+            return None
+
+        cache_key = f"{chat_id_int}:{name}"
+        cached = self._dm_topics.get(cache_key)
+        if cached and not force_create:
+            return str(cached)
+
+        topic_conf: Optional[Dict[str, Any]] = None
+        chat_entry: Optional[Dict[str, Any]] = None
+        for entry in self._dm_topics_config:
+            if str(entry.get("chat_id")) != str(chat_id_int):
+                continue
+            chat_entry = entry
+            for candidate in entry.get("topics", []):
+                if candidate.get("name") == name:
+                    topic_conf = candidate
+                    break
+            break
+
+        if topic_conf and topic_conf.get("thread_id") and not force_create:
+            thread_id = int(topic_conf["thread_id"])
+            self._dm_topics[cache_key] = thread_id
+            return str(thread_id)
+
+        if chat_entry is None:
+            chat_entry = {"chat_id": chat_id_int, "topics": []}
+            self._dm_topics_config.append(chat_entry)
+        if topic_conf is None:
+            topic_conf = {"name": name}
+            chat_entry.setdefault("topics", []).append(topic_conf)
+
+        thread_id = self._create_dm_topic_sync(
+            chat_id_int,
+            name=name,
+            icon_color=topic_conf.get("icon_color"),
+            icon_custom_emoji_id=topic_conf.get("icon_custom_emoji_id"),
+        )
+        if not thread_id:
+            return None
+
+        topic_conf["thread_id"] = int(thread_id)
+        self._dm_topics[cache_key] = int(thread_id)
+        self._persist_dm_topic_thread_id(
+            chat_id_int,
+            name,
+            int(thread_id),
+            replace_existing=force_create,
+        )
+        return str(thread_id)
+
+    def _create_dm_topic_sync(
+        self,
+        chat_id: int,
+        name: str,
+        icon_color: Optional[int] = None,
+        icon_custom_emoji_id: Optional[str] = None,
+    ) -> Optional[int]:
+        """Create a private DM topic via the HTTPS Bot API."""
+        token = str(getattr(self.config, "token", "") or os.environ.get("TELEGRAM_BOT_TOKEN", "")).strip()
+        if not token:
+            return None
+        payload: Dict[str, Any] = {"chat_id": chat_id, "name": name}
+        if icon_color is not None:
+            payload["icon_color"] = icon_color
+        if icon_custom_emoji_id:
+            payload["icon_custom_emoji_id"] = icon_custom_emoji_id
+
+        data = urllib.parse.urlencode(payload).encode("utf-8")
+        request = urllib.request.Request(
+            f"https://api.telegram.org/bot{token}/createForumTopic",
+            data=data,
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=20) as response:
+                body = json.load(response)
+            thread_id = body.get("result", {}).get("message_thread_id")
+            if not body.get("ok") or not thread_id:
+                logger.warning(
+                    "[%s] Failed to create DM topic '%s' in chat %s via Bot API: %s",
+                    self.name, name, chat_id, body,
+                )
+                return None
+            logger.info(
+                "[%s] Created DM topic '%s' in chat %s -> thread_id=%s",
+                self.name, name, chat_id, thread_id,
+            )
+            return int(thread_id)
+        except Exception as exc:
+            error_text = str(exc).lower()
+            if "topic_name_duplicate" in error_text or "already" in error_text:
+                logger.warning(
+                    "[%s] DM topic '%s' already exists in chat %s but is not "
+                    "present in dm_topics config; cannot route to it until a "
+                    "thread_id is known",
+                    self.name, name, chat_id,
+                )
+            else:
+                logger.warning(
+                    "[%s] Failed to create DM topic '%s' in chat %s via Bot API: %s",
+                    self.name, name, chat_id, exc,
+                )
+            return None
 
     async def rename_dm_topic(
         self,

@@ -2,9 +2,10 @@
 
 The hook allows plugins to intercept incoming messages before auth and
 agent dispatch. It runs in _handle_message and acts on returned action
-dicts: {"action": "skip"|"rewrite"|"allow"}.
+dicts: {"action": "skip"|"rewrite"|"reroute"|"allow"}.
 """
 
+import dataclasses
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
@@ -106,6 +107,55 @@ async def test_hook_rewrite_replaces_event_text(monkeypatch):
     await runner._handle_message(_make_event("original"))
 
     assert seen_text.get("value") == "REWRITTEN"
+
+
+@pytest.mark.asyncio
+async def test_hook_reroute_replaces_event_source(monkeypatch):
+    """A plugin returning {'action': 'reroute', 'event': ...} replaces the event."""
+    _clear_auth_env(monkeypatch)
+    monkeypatch.setenv("WHATSAPP_ALLOWED_USERS", "*")
+
+    seen = {}
+    target_source = SessionSource(
+        platform=Platform.WHATSAPP,
+        user_id="15551234567@s.whatsapp.net",
+        chat_id="main-chat",
+        user_name="tester",
+        chat_type="dm",
+        thread_id="main",
+    )
+
+    def _fake_hook(name, **kwargs):
+        if name == "pre_gateway_dispatch":
+            rerouted = dataclasses.replace(
+                kwargs["event"],
+                text="REROUTED",
+                source=target_source,
+                message_id=None,
+            )
+            return [{"action": "reroute", "event": rerouted}]
+        return []
+
+    async def _capture(event, source, _quick_key, _run_generation):
+        seen["text"] = event.text
+        seen["event_source"] = event.source
+        seen["source"] = source
+        seen["message_id"] = event.message_id
+        return "ok"
+
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", _fake_hook)
+
+    runner, _adapter = _make_runner(Platform.WHATSAPP)
+    runner._handle_message_with_agent = _capture  # noqa: SLF001
+
+    await runner._handle_message(_make_event("original"))
+
+    assert seen == {
+        "text": "REROUTED",
+        "event_source": target_source,
+        "source": target_source,
+        "message_id": None,
+    }
 
 
 @pytest.mark.asyncio

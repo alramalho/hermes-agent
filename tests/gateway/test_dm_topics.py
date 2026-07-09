@@ -252,6 +252,45 @@ async def test_ensure_dm_topic_force_create_replaces_persisted_thread_id():
     )
 
 
+def test_ensure_dm_topic_sync_uses_persisted_thread_id():
+    adapter = _make_adapter([
+        {
+            "chat_id": 111,
+            "topics": [{"name": "main", "thread_id": 500}],
+        }
+    ])
+    adapter._create_dm_topic_sync = MagicMock()
+
+    result = adapter.ensure_dm_topic_sync("111", "main")
+
+    assert result == "500"
+    assert adapter._dm_topics["111:main"] == 500
+    adapter._create_dm_topic_sync.assert_not_called()
+
+
+def test_ensure_dm_topic_sync_creates_and_persists_missing_topic():
+    adapter = _make_adapter()
+    adapter._create_dm_topic_sync = MagicMock(return_value=888)
+    adapter._persist_dm_topic_thread_id = MagicMock()
+
+    result = adapter.ensure_dm_topic_sync("111", "main")
+
+    assert result == "888"
+    adapter._create_dm_topic_sync.assert_called_once_with(
+        111,
+        name="main",
+        icon_color=None,
+        icon_custom_emoji_id=None,
+    )
+    assert adapter._dm_topics["111:main"] == 888
+    assert adapter._dm_topics_config == [
+        {"chat_id": 111, "topics": [{"name": "main", "thread_id": 888}]}
+    ]
+    adapter._persist_dm_topic_thread_id.assert_called_once_with(
+        111, "main", 888, replace_existing=False
+    )
+
+
 @pytest.mark.asyncio
 async def test_delete_dm_topic_calls_delete_forum_topic():
     adapter = _make_adapter()

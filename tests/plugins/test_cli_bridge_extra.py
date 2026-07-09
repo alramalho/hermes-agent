@@ -468,8 +468,13 @@ def test_fresh_telegram_topic_requires_receiver_word(tmp_path: Path) -> None:
     fake_tmux = FakeTmux()
     replies: list[str] = []
     deleted_topics: list[tuple[str, str]] = []
+    ensured_topics: list[tuple[str, str]] = []
 
     class Adapter:
+        def ensure_dm_topic_sync(self, chat_id, topic_name):
+            ensured_topics.append((chat_id, topic_name))
+            return "main-topic"
+
         async def delete_dm_topic(self, chat_id, thread_id):
             deleted_topics.append((chat_id, thread_id))
             return True
@@ -482,18 +487,30 @@ def test_fresh_telegram_topic_requires_receiver_word(tmp_path: Path) -> None:
         session_store=_topic_session_store(has_session=False),
     )
 
-    assert result == {"action": "skip", "reason": "cli-bridge-receiver"}
+    assert result["action"] == "reroute"
+    assert result["reason"] == "cli-bridge-receiver-main"
+    assert result["event"].text == "hello from a new topic"
+    assert result["event"].message_id is None
+    assert result["event"].source.thread_id == "main-topic"
+    assert result["event"].source.chat_topic == "main"
+    assert result["event"].source.message_id is None
+    assert ensured_topics == [("chat1", "main")]
     assert deleted_topics == [("chat1", "new-topic")]
     assert replies == []
     assert fake_tmux.started == []
 
 
-def test_fresh_telegram_topic_empty_receiver_word_deletes_topic(tmp_path: Path) -> None:
+def test_fresh_telegram_topic_empty_receiver_word_reroutes_to_main(tmp_path: Path) -> None:
     fake_tmux = FakeTmux()
     replies: list[str] = []
     deleted_topics: list[tuple[str, str]] = []
+    ensured_topics: list[tuple[str, str]] = []
 
     class Adapter:
+        def ensure_dm_topic_sync(self, chat_id, topic_name):
+            ensured_topics.append((chat_id, topic_name))
+            return "main-topic"
+
         async def delete_dm_topic(self, chat_id, thread_id):
             deleted_topics.append((chat_id, thread_id))
             return True
@@ -506,28 +523,41 @@ def test_fresh_telegram_topic_empty_receiver_word_deletes_topic(tmp_path: Path) 
         session_store=_topic_session_store(has_session=False),
     )
 
-    assert result == {"action": "skip", "reason": "cli-bridge-receiver"}
+    assert result["action"] == "reroute"
+    assert result["event"].text == "codex"
+    assert result["event"].source.thread_id == "main-topic"
+    assert ensured_topics == [("chat1", "main")]
     assert deleted_topics == [("chat1", "new-topic")]
     assert replies == []
     assert fake_tmux.started == []
 
 
-def test_fresh_telegram_topic_receiver_hermes_rewrites_prompt(tmp_path: Path) -> None:
+def test_fresh_telegram_topic_receiver_hermes_reroutes_prompt(tmp_path: Path) -> None:
     fake_tmux = FakeTmux()
     replies: list[str] = []
+    deleted_topics: list[tuple[str, str]] = []
+
+    class Adapter:
+        def ensure_dm_topic_sync(self, chat_id, topic_name):
+            return "main-topic"
+
+        async def delete_dm_topic(self, chat_id, thread_id):
+            deleted_topics.append((chat_id, thread_id))
+            return True
+
     plugin = _plugin(fake_tmux, replies, tmp_path)
 
     result = plugin.handle_pre_gateway_dispatch(
         event=_event("hermes summarize this", thread_id="new-topic"),
-        gateway=_gateway(),
+        gateway=_gateway(adapters={Platform.TELEGRAM: Adapter()}),
         session_store=_topic_session_store(has_session=False),
     )
 
-    assert result == {
-        "action": "rewrite",
-        "text": "summarize this",
-        "reason": "cli-bridge-receiver-hermes",
-    }
+    assert result["action"] == "reroute"
+    assert result["event"].text == "summarize this"
+    assert result["event"].source.thread_id == "main-topic"
+    assert result["event"].source.chat_topic == "main"
+    assert deleted_topics == [("chat1", "new-topic")]
     assert replies == []
     assert fake_tmux.started == []
 
