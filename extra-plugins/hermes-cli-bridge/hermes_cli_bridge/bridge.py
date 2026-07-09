@@ -31,6 +31,24 @@ _OSC_RE = re.compile(r"\x1B\](?:[^\x07\x1B]|\x1B(?!\\))*?(?:\x07|\x1B\\)")
 _ANSI_RE = re.compile(r"\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
 _CONTROL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 _NO_SELECTED_SESSION = "\x00none"
+_RECEIVER_HELP = (
+    "Start this topic with `hermes <message>`, `codex <message>`, or "
+    "`claude <message>`."
+)
+_RECEIVER_CONTROL_SUBCOMMANDS = {
+    "init",
+    "list",
+    "select",
+    "rename",
+    "send",
+    "status",
+    "exit",
+    "kill",
+    "end",
+    "help",
+    "-h",
+    "--help",
+}
 
 
 def _env_float(name: str, default: float) -> float:
@@ -308,7 +326,6 @@ class CliBridgePlugin:
         session_store: Any = None,
         **_: Any,
     ) -> dict[str, str] | None:
-        del session_store
         if event is None or gateway is None or getattr(event, "internal", False):
             return None
 
@@ -337,6 +354,12 @@ class CliBridgePlugin:
 
         session = self._session_for_event(event, require_live=True)
         if session is None:
+            if self._should_gate_telegram_topic_receiver(event, session_store):
+                return self._handle_telegram_topic_receiver(
+                    text,
+                    event,
+                    gateway,
+                )
             return None
 
         if not self._authorized(gateway, event):
@@ -384,6 +407,177 @@ class CliBridgePlugin:
             logger.warning("cli-bridge send failed: %s", exc)
             self._reply(gateway, event, f"[{session.agent}] send failed: {exc}")
         return {"action": "skip", "reason": "cli-bridge-input"}
+
+    def _should_gate_telegram_topic_receiver(
+        self,
+        event: Any,
+        session_store: Any,
+    ) -> bool:
+        if not _env_bool("HERMES_CLI_BRIDGE_TELEGRAM_RECEIVER", True):
+            return False
+        source = getattr(event, "source", None)
+        if _platform_value(getattr(source, "platform", "")) != "telegram":
+            return False
+        if str(getattr(source, "chat_type", "") or "") != "dm":
+            return False
+        if not str(getattr(source, "chat_id", "") or ""):
+            return False
+        thread_id = str(getattr(source, "thread_id", "") or "")
+        if not thread_id or thread_id == "1":
+            return False
+        return not self._has_gateway_session_for_event(event, session_store)
+
+    def _has_gateway_session_for_event(self, event: Any, session_store: Any) -> bool:
+        source = getattr(event, "source", None)
+        if source is None or session_store is None:
+            return False
+
+        session_key = ""
+        generator = getattr(session_store, "_generate_session_key", None)
+        if callable(generator):
+            try:
+                session_key = str(generator(source) or "")
+            except Exception as exc:
+                logger.debug("cli-bridge receiver session-key lookup failed: %s", exc)
+        if not session_key:
+            try:
+                from gateway.session import build_session_key
+
+                session_key = str(build_session_key(source) or "")
+            except Exception as exc:
+                logger.debug("cli-bridge receiver fallback session-key failed: %s", exc)
+                return False
+
+        try:
+            lock = getattr(session_store, "_lock", None)
+            if lock is not None:
+                with lock:
+                    ensure_locked = getattr(session_store, "_ensure_loaded_locked", None)
+                    if callable(ensure_locked):
+                        ensure_locked()
+                    entries = getattr(session_store, "_entries", {}) or {}
+                    entry = entries.get(session_key)
+            else:
+                ensure = getattr(session_store, "_ensure_loaded", None)
+                if callable(ensure):
+                    ensure()
+                entries = getattr(session_store, "_entries", {}) or {}
+                entry = entries.get(session_key)
+        except Exception as exc:
+            logger.debug("cli-bridge receiver session-store lookup failed: %s", exc)
+            return False
+
+        if entry is None or bool(getattr(entry, "suspended", False)):
+            return False
+        ended = getattr(session_store, "_is_session_ended_in_db", None)
+        session_id = str(getattr(entry, "session_id", "") or "")
+        if callable(ended) and session_id:
+            try:
+                if ended(session_id):
+                    return False
+            except Exception as exc:
+                logger.debug("cli-bridge receiver ended-session lookup failed: %s", exc)
+        return True
+
+    def _handle_telegram_topic_receiver(
+        self,
+        text: str,
+        event: Any,
+        gateway: Any,
+    ) -> dict[str, str]:
+        if not self._authorized(gateway, event):
+            return {"action": "allow"}
+
+        invocation = self._parse_receiver_invocation(text)
+        if invocation is None:
+            self._reply(gateway, event, _RECEIVER_HELP)
+            return {"action": "skip", "reason": "cli-bridge-receiver"}
+
+        agent, rest = invocation
+        if agent == "hermes":
+            if not rest:
+                self._reply(gateway, event, "Usage: `hermes <message>`.")
+                return {"action": "skip", "reason": "cli-bridge-receiver"}
+            return {
+                "action": "rewrite",
+                "text": rest,
+                "reason": "cli-bridge-receiver-hermes",
+            }
+
+        if not rest:
+            self._reply(gateway, event, f"Usage: `{agent} <message>`.")
+            return {"action": "skip", "reason": "cli-bridge-receiver"}
+
+        if self._receiver_control_subcommand(rest) in _RECEIVER_CONTROL_SUBCOMMANDS:
+            try:
+                reply = self._handle_control(agent, rest, event, gateway)
+            except Exception as exc:
+                logger.warning("cli-bridge receiver control failed: %s", exc)
+                reply = f"[{agent}] failed: {exc}"
+            if reply:
+                self._reply(gateway, event, reply)
+            return {"action": "skip", "reason": "cli-bridge-receiver-control"}
+
+        try:
+            start_reply = self._start_session(agent, "default", None, event, gateway)
+            session = self._session_for_event(event, agent=agent, require_live=True)
+            if session is None:
+                self._reply(
+                    gateway,
+                    event,
+                    f"{start_reply}\nPrompt not sent: bridge session is unavailable.",
+                )
+                return {"action": "skip", "reason": "cli-bridge-receiver"}
+
+            payload = self._receiver_payload(event, rest)
+            if session.backend == "exec":
+                routed = self._route_exec_input(session, payload, gateway, event)
+            else:
+                routed = self._route_tmux_input(session, payload, gateway, event)
+            session.last_activity = time.time()
+            self._send_typing(gateway, event)
+            if routed:
+                self._reply(gateway, event, f"{start_reply}\nPrompt sent.")
+            else:
+                self._reply(
+                    gateway,
+                    event,
+                    f"{start_reply}\n[{agent}] busy; previous prompt is still running.",
+                )
+        except Exception as exc:
+            logger.warning("cli-bridge receiver failed: %s", exc)
+            self._reply(gateway, event, f"[{agent}] failed: {exc}")
+        return {"action": "skip", "reason": "cli-bridge-receiver"}
+
+    def _parse_receiver_invocation(self, text: str) -> tuple[str, str] | None:
+        stripped = text.strip()
+        if not stripped:
+            return None
+        head, _, rest = stripped.partition(" ")
+        command = head.rstrip(":").lower()
+        if command == "hermes":
+            return command, rest.strip()
+        if command in PROFILES:
+            return command, rest.strip()
+        return None
+
+    def _receiver_control_subcommand(self, raw_args: str) -> str | None:
+        try:
+            argv = shlex.split(raw_args)
+        except ValueError:
+            return None
+        if not argv:
+            return None
+        return argv[0].lower()
+
+    def _receiver_payload(self, event: Any, text: str) -> str:
+        parts: list[str] = []
+        if text.strip():
+            parts.append(text.strip())
+        media_note = self._media_payload(event)
+        if media_note:
+            parts.append(media_note)
+        return "\n\n".join(parts).strip()
 
     def _parse_control_command(self, text: str) -> tuple[str, str] | None:
         stripped = text.strip()

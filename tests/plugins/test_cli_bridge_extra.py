@@ -196,6 +196,18 @@ def _plugin(
     return plugin
 
 
+def _topic_session_store(has_session: bool = False) -> SimpleNamespace:
+    key = "topic-session-key"
+    entries = {}
+    if has_session:
+        entries[key] = SimpleNamespace(session_id="sess-topic", suspended=False)
+    return SimpleNamespace(
+        _generate_session_key=lambda _source: key,
+        _ensure_loaded=lambda: None,
+        _entries=entries,
+    )
+
+
 def test_register_adds_hook_and_commands() -> None:
     manager = PluginManager()
     manifest = PluginManifest(name="cli-bridge", source="entrypoint", key="cli-bridge")
@@ -450,6 +462,102 @@ def test_init_inside_existing_telegram_topic_does_not_create_topic(
     assert result == {"action": "skip", "reason": "cli-bridge-control"}
     assert topic_calls == []
     assert replies[-1].startswith("[codex:api] started in")
+
+
+def test_fresh_telegram_topic_requires_receiver_word(tmp_path: Path) -> None:
+    fake_tmux = FakeTmux()
+    replies: list[str] = []
+    plugin = _plugin(fake_tmux, replies, tmp_path)
+
+    result = plugin.handle_pre_gateway_dispatch(
+        event=_event("hello from a new topic", thread_id="new-topic"),
+        gateway=_gateway(),
+        session_store=_topic_session_store(has_session=False),
+    )
+
+    assert result == {"action": "skip", "reason": "cli-bridge-receiver"}
+    assert "hermes <message>" in replies[-1]
+    assert "codex <message>" in replies[-1]
+    assert "claude <message>" in replies[-1]
+    assert fake_tmux.started == []
+
+
+def test_fresh_telegram_topic_receiver_hermes_rewrites_prompt(tmp_path: Path) -> None:
+    fake_tmux = FakeTmux()
+    replies: list[str] = []
+    plugin = _plugin(fake_tmux, replies, tmp_path)
+
+    result = plugin.handle_pre_gateway_dispatch(
+        event=_event("hermes summarize this", thread_id="new-topic"),
+        gateway=_gateway(),
+        session_store=_topic_session_store(has_session=False),
+    )
+
+    assert result == {
+        "action": "rewrite",
+        "text": "summarize this",
+        "reason": "cli-bridge-receiver-hermes",
+    }
+    assert replies == []
+    assert fake_tmux.started == []
+
+
+def test_fresh_telegram_topic_receiver_codex_starts_and_sends_prompt(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    fake_tmux = FakeTmux()
+    replies: list[str] = []
+    plugin = _plugin(fake_tmux, replies, tmp_path)
+    monkeypatch.chdir(tmp_path)
+
+    result = plugin.handle_pre_gateway_dispatch(
+        event=_event("codex fix the login bug", thread_id="new-topic"),
+        gateway=_gateway(),
+        session_store=_topic_session_store(has_session=False),
+    )
+
+    assert result == {"action": "skip", "reason": "cli-bridge-receiver"}
+    session_name = str(fake_tmux.started[0]["session_name"])
+    assert fake_tmux.inputs == [(session_name, "fix the login bug")]
+    assert replies[-1].startswith("[codex:default] started in")
+    assert replies[-1].endswith("Prompt sent.")
+
+
+def test_fresh_telegram_topic_receiver_codex_init_uses_bridge_control(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    fake_tmux = FakeTmux()
+    replies: list[str] = []
+    plugin = _plugin(fake_tmux, replies, tmp_path)
+    monkeypatch.chdir(tmp_path)
+
+    result = plugin.handle_pre_gateway_dispatch(
+        event=_event("codex init api", thread_id="new-topic"),
+        gateway=_gateway(),
+        session_store=_topic_session_store(has_session=False),
+    )
+
+    assert result == {"action": "skip", "reason": "cli-bridge-receiver-control"}
+    assert replies[-1].startswith("[codex:api] started in")
+    assert fake_tmux.inputs == []
+
+
+def test_existing_hermes_topic_allows_plain_followups(tmp_path: Path) -> None:
+    fake_tmux = FakeTmux()
+    replies: list[str] = []
+    plugin = _plugin(fake_tmux, replies, tmp_path)
+
+    result = plugin.handle_pre_gateway_dispatch(
+        event=_event("plain followup", thread_id="existing-topic"),
+        gateway=_gateway(),
+        session_store=_topic_session_store(has_session=True),
+    )
+
+    assert result is None
+    assert replies == []
+    assert fake_tmux.started == []
 
 
 def test_named_sessions_can_be_listed_selected_and_cleared(
