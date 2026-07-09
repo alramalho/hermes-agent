@@ -2472,6 +2472,44 @@ class TelegramAdapter(BasePlatformAdapter):
             self.name, chat_id, thread_id, name,
         )
 
+    async def delete_dm_topic(
+        self,
+        chat_id: str,
+        thread_id: str,
+    ) -> bool:
+        """Delete a private DM topic by thread id."""
+        if not self._bot:
+            return False
+        if not thread_id or str(thread_id) == "1":
+            return False
+        try:
+            chat_id_arg: int | str = int(chat_id)
+            thread_id_arg = int(thread_id)
+        except (TypeError, ValueError):
+            return False
+        try:
+            delete_forum_topic = getattr(self._bot, "delete_forum_topic", None)
+            if delete_forum_topic is None:
+                delete_forum_topic = getattr(self._bot, "deleteForumTopic", None)
+            if delete_forum_topic is None:
+                return False
+            await delete_forum_topic(
+                chat_id=chat_id_arg,
+                message_thread_id=thread_id_arg,
+            )
+            self._prune_stale_dm_topic_binding(chat_id_arg, thread_id_arg)
+            logger.info(
+                "[%s] Deleted DM topic in chat %s thread_id=%s",
+                self.name, chat_id_arg, thread_id_arg,
+            )
+            return True
+        except Exception as exc:
+            logger.warning(
+                "[%s] Failed to delete DM topic in chat %s thread_id=%s: %s",
+                self.name, chat_id_arg, thread_id_arg, exc,
+            )
+            return False
+
     def _persist_dm_topic_thread_id(
         self,
         chat_id: int,

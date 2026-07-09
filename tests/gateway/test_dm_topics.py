@@ -252,6 +252,44 @@ async def test_ensure_dm_topic_force_create_replaces_persisted_thread_id():
     )
 
 
+@pytest.mark.asyncio
+async def test_delete_dm_topic_calls_delete_forum_topic():
+    adapter = _make_adapter()
+    adapter._bot = AsyncMock()
+    adapter._prune_stale_dm_topic_binding = MagicMock()
+
+    result = await adapter.delete_dm_topic("111", "444")
+
+    assert result is True
+    adapter._bot.delete_forum_topic.assert_called_once_with(
+        chat_id=111,
+        message_thread_id=444,
+    )
+    adapter._prune_stale_dm_topic_binding.assert_called_once_with(111, 444)
+
+
+@pytest.mark.asyncio
+async def test_delete_dm_topic_rejects_general_topic():
+    adapter = _make_adapter()
+    adapter._bot = AsyncMock()
+
+    result = await adapter.delete_dm_topic("111", "1")
+
+    assert result is False
+    adapter._bot.delete_forum_topic.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_delete_dm_topic_handles_api_error():
+    adapter = _make_adapter()
+    adapter._bot = AsyncMock()
+    adapter._bot.delete_forum_topic.side_effect = Exception("thread not found")
+
+    result = await adapter.delete_dm_topic("111", "444")
+
+    assert result is False
+
+
 # ── _persist_dm_topic_thread_id ──
 
 

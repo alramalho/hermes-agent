@@ -31,10 +31,6 @@ _OSC_RE = re.compile(r"\x1B\](?:[^\x07\x1B]|\x1B(?!\\))*?(?:\x07|\x1B\\)")
 _ANSI_RE = re.compile(r"\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
 _CONTROL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 _NO_SELECTED_SESSION = "\x00none"
-_RECEIVER_HELP = (
-    "Start this topic with `hermes <message>`, `codex <message>`, or "
-    "`claude <message>`."
-)
 _RECEIVER_CONTROL_SUBCOMMANDS = {
     "init",
     "list",
@@ -490,13 +486,13 @@ class CliBridgePlugin:
 
         invocation = self._parse_receiver_invocation(text)
         if invocation is None:
-            self._reply(gateway, event, _RECEIVER_HELP)
+            self._delete_fresh_telegram_topic(event, gateway)
             return {"action": "skip", "reason": "cli-bridge-receiver"}
 
         agent, rest = invocation
         if agent == "hermes":
             if not rest:
-                self._reply(gateway, event, "Usage: `hermes <message>`.")
+                self._delete_fresh_telegram_topic(event, gateway)
                 return {"action": "skip", "reason": "cli-bridge-receiver"}
             return {
                 "action": "rewrite",
@@ -505,7 +501,7 @@ class CliBridgePlugin:
             }
 
         if not rest:
-            self._reply(gateway, event, f"Usage: `{agent} <message>`.")
+            self._delete_fresh_telegram_topic(event, gateway)
             return {"action": "skip", "reason": "cli-bridge-receiver"}
 
         if self._receiver_control_subcommand(rest) in _RECEIVER_CONTROL_SUBCOMMANDS:
@@ -578,6 +574,42 @@ class CliBridgePlugin:
         if media_note:
             parts.append(media_note)
         return "\n\n".join(parts).strip()
+
+    def _delete_fresh_telegram_topic(self, event: Any, gateway: Any) -> None:
+        source = getattr(event, "source", None)
+        chat_id = str(getattr(source, "chat_id", "") or "")
+        thread_id = str(getattr(source, "thread_id", "") or "")
+        if not chat_id or not thread_id or thread_id == "1":
+            return
+        adapter = self._adapter_for_source(gateway, source)
+        delete_topic = getattr(adapter, "delete_dm_topic", None)
+        if not callable(delete_topic):
+            logger.info(
+                "cli-bridge receiver cannot delete accidental Telegram topic: "
+                "adapter has no delete_dm_topic chat=%s thread=%s",
+                chat_id,
+                thread_id,
+            )
+            return
+        try:
+            result = delete_topic(chat_id, thread_id)
+            if inspect.isawaitable(result):
+                self._schedule_awaitable(gateway, result, label="topic delete")
+            elif not result:
+                logger.info(
+                    "cli-bridge receiver did not delete accidental Telegram topic: "
+                    "chat=%s thread=%s",
+                    chat_id,
+                    thread_id,
+                )
+        except Exception as exc:
+            logger.warning(
+                "cli-bridge receiver failed deleting accidental Telegram topic: "
+                "chat=%s thread=%s error=%s",
+                chat_id,
+                thread_id,
+                exc,
+            )
 
     def _parse_control_command(self, text: str) -> tuple[str, str] | None:
         stripped = text.strip()

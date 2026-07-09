@@ -467,18 +467,48 @@ def test_init_inside_existing_telegram_topic_does_not_create_topic(
 def test_fresh_telegram_topic_requires_receiver_word(tmp_path: Path) -> None:
     fake_tmux = FakeTmux()
     replies: list[str] = []
+    deleted_topics: list[tuple[str, str]] = []
+
+    class Adapter:
+        async def delete_dm_topic(self, chat_id, thread_id):
+            deleted_topics.append((chat_id, thread_id))
+            return True
+
     plugin = _plugin(fake_tmux, replies, tmp_path)
 
     result = plugin.handle_pre_gateway_dispatch(
         event=_event("hello from a new topic", thread_id="new-topic"),
-        gateway=_gateway(),
+        gateway=_gateway(adapters={Platform.TELEGRAM: Adapter()}),
         session_store=_topic_session_store(has_session=False),
     )
 
     assert result == {"action": "skip", "reason": "cli-bridge-receiver"}
-    assert "hermes <message>" in replies[-1]
-    assert "codex <message>" in replies[-1]
-    assert "claude <message>" in replies[-1]
+    assert deleted_topics == [("chat1", "new-topic")]
+    assert replies == []
+    assert fake_tmux.started == []
+
+
+def test_fresh_telegram_topic_empty_receiver_word_deletes_topic(tmp_path: Path) -> None:
+    fake_tmux = FakeTmux()
+    replies: list[str] = []
+    deleted_topics: list[tuple[str, str]] = []
+
+    class Adapter:
+        async def delete_dm_topic(self, chat_id, thread_id):
+            deleted_topics.append((chat_id, thread_id))
+            return True
+
+    plugin = _plugin(fake_tmux, replies, tmp_path)
+
+    result = plugin.handle_pre_gateway_dispatch(
+        event=_event("codex", thread_id="new-topic"),
+        gateway=_gateway(adapters={Platform.TELEGRAM: Adapter()}),
+        session_store=_topic_session_store(has_session=False),
+    )
+
+    assert result == {"action": "skip", "reason": "cli-bridge-receiver"}
+    assert deleted_topics == [("chat1", "new-topic")]
+    assert replies == []
     assert fake_tmux.started == []
 
 
