@@ -292,6 +292,47 @@ def test_ensure_dm_topic_sync_creates_and_persists_missing_topic():
 
 
 @pytest.mark.asyncio
+async def test_rename_dm_topic_calls_edit_forum_topic():
+    adapter = _make_adapter()
+    adapter._bot = AsyncMock()
+
+    result = await adapter.rename_dm_topic("111", "444", "Project Alpha")
+
+    assert result is True
+    adapter._bot.edit_forum_topic.assert_called_once_with(
+        chat_id=111,
+        message_thread_id=444,
+        name="Project Alpha",
+    )
+
+
+@pytest.mark.asyncio
+async def test_rename_dm_topic_rejects_general_topic():
+    adapter = _make_adapter()
+    adapter._bot = AsyncMock()
+
+    result = await adapter.rename_dm_topic("111", "1", "Project Alpha")
+
+    assert result is False
+    adapter._bot.edit_forum_topic.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_set_dm_topic_icon_calls_edit_forum_topic():
+    adapter = _make_adapter()
+    adapter._bot = AsyncMock()
+
+    result = await adapter.set_dm_topic_icon("111", "444", "icon-id")
+
+    assert result is True
+    adapter._bot.edit_forum_topic.assert_called_once_with(
+        chat_id=111,
+        message_thread_id=444,
+        icon_custom_emoji_id="icon-id",
+    )
+
+
+@pytest.mark.asyncio
 async def test_delete_dm_topic_calls_delete_forum_topic():
     adapter = _make_adapter()
     adapter._bot = AsyncMock()

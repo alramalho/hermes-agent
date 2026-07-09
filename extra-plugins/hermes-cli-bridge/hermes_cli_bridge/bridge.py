@@ -45,6 +45,11 @@ _RECEIVER_CONTROL_SUBCOMMANDS = {
     "-h",
     "--help",
 }
+_TELEGRAM_AGENT_TOPIC_ICONS = {
+    # Telegram default "Topics" custom emoji IDs returned by getForumTopicIconStickers.
+    "codex": "5386395194029515402",  # black flag, closest allowed dark icon
+    "claude": "5309744892677727325",  # pumpkin, closest allowed orange icon
+}
 
 
 def _env_float(name: str, default: float) -> float:
@@ -303,6 +308,12 @@ class CliBridgePlugin:
 
     def register(self, ctx: Any) -> None:
         ctx.register_hook("pre_gateway_dispatch", self.handle_pre_gateway_dispatch)
+        ctx.register_command(
+            "rename",
+            handler=self._rename_command_stub,
+            description="Rename the current Telegram topic.",
+            args_hint="<name>",
+        )
         for agent in PROFILES:
             ctx.register_command(
                 agent,
@@ -314,6 +325,10 @@ class CliBridgePlugin:
     def _command_stub(self, agent: str, raw_args: str) -> str:
         del raw_args
         return self._help(agent)
+
+    def _rename_command_stub(self, raw_args: str) -> str:
+        del raw_args
+        return "Usage: /rename <name>"
 
     def handle_pre_gateway_dispatch(
         self,
@@ -344,6 +359,15 @@ class CliBridgePlugin:
             if reply:
                 self._reply(gateway, event, reply)
             return {"action": "skip", "reason": "cli-bridge-control"}
+
+        topic_rename = self._parse_topic_rename_command(text) if text.strip() else None
+        if topic_rename is not None:
+            if not self._authorized(gateway, event):
+                return {"action": "allow"}
+            reply = self._handle_topic_rename(topic_rename, event, gateway)
+            if reply:
+                self._reply(gateway, event, reply)
+            return {"action": "skip", "reason": "cli-bridge-topic-rename"}
 
         if text.lstrip().startswith("/"):
             return None
@@ -509,6 +533,7 @@ class CliBridgePlugin:
 
         try:
             start_reply = self._start_session(agent, "default", None, event, gateway)
+            self._set_telegram_agent_topic_icon(agent, event, gateway)
             session = self._session_for_event(event, agent=agent, require_live=True)
             if session is None:
                 self._reply(
@@ -685,6 +710,96 @@ class CliBridgePlugin:
             return None
         return command, raw_args.strip()
 
+    def _parse_topic_rename_command(self, text: str) -> str | None:
+        stripped = text.strip()
+        if not stripped.startswith("/"):
+            return None
+        head, _, raw_args = stripped[1:].partition(" ")
+        command = head.split("@", 1)[0].replace("_", "-").lower()
+        if command != "rename":
+            return None
+        return raw_args.strip()
+
+    def _handle_topic_rename(
+        self,
+        raw_name: str,
+        event: Any,
+        gateway: Any,
+    ) -> str | None:
+        name, error = self._normalize_topic_rename_name(raw_name)
+        if error:
+            return error
+        source = getattr(event, "source", None)
+        if _platform_value(getattr(source, "platform", "")) != "telegram":
+            return "/rename is only available in Telegram topics."
+        chat_id = str(getattr(source, "chat_id", "") or "")
+        thread_id = str(getattr(source, "thread_id", "") or "")
+        if not chat_id or not thread_id or thread_id == "1":
+            return "Run /rename inside the topic you want to rename."
+        adapter = self._adapter_for_source(gateway, source)
+        rename_topic = getattr(adapter, "rename_dm_topic", None)
+        if not callable(rename_topic):
+            return "Telegram topic rename is not available for this adapter."
+        try:
+            result = rename_topic(chat_id=chat_id, thread_id=thread_id, name=name)
+        except Exception as exc:
+            logger.warning(
+                "cli-bridge topic rename failed: chat=%s thread=%s name=%r error=%s",
+                chat_id,
+                thread_id,
+                name,
+                exc,
+            )
+            return f"Failed to rename topic: {exc}"
+        if inspect.isawaitable(result):
+            self._schedule_topic_rename_result(gateway, event, result, name)
+            return None
+        if result is False:
+            return "Failed to rename topic."
+        return f"Renamed topic to {name}."
+
+    def _normalize_topic_rename_name(self, raw_name: str) -> tuple[str, str | None]:
+        cleaned = re.sub(r"\s+", " ", raw_name or "").strip()
+        if (
+            len(cleaned) >= 2
+            and cleaned[0] == cleaned[-1]
+            and cleaned[0] in {'"', "'"}
+        ):
+            cleaned = cleaned[1:-1].strip()
+        if not cleaned:
+            return "", "Usage: /rename <name>"
+        if len(cleaned) > 128:
+            return "", "Topic name must be 128 characters or fewer."
+        return cleaned, None
+
+    def _schedule_topic_rename_result(
+        self,
+        gateway: Any,
+        event: Any,
+        awaitable: Any,
+        name: str,
+    ) -> None:
+        async def _worker() -> None:
+            source = getattr(event, "source", None)
+            try:
+                result = await awaitable
+            except Exception as exc:
+                logger.warning(
+                    "cli-bridge topic rename failed: chat=%s thread=%s name=%r error=%s",
+                    str(getattr(source, "chat_id", "") or ""),
+                    str(getattr(source, "thread_id", "") or ""),
+                    name,
+                    exc,
+                )
+                self._reply(gateway, event, f"Failed to rename topic: {exc}")
+                return
+            if result is False:
+                self._reply(gateway, event, "Failed to rename topic.")
+                return
+            self._reply(gateway, event, f"Renamed topic to {name}.")
+
+        self._schedule_awaitable(gateway, _worker(), label="topic rename")
+
     def _handle_control(
         self,
         agent: str,
@@ -708,7 +823,9 @@ class CliBridgePlugin:
                 return f"[{agent}] {exc}"
             if self._schedule_telegram_topic_init(agent, name, cwd_arg, event, gateway):
                 return None
-            return self._start_session(agent, name, cwd_arg, event, gateway)
+            reply = self._start_session(agent, name, cwd_arg, event, gateway)
+            self._set_telegram_agent_topic_icon(agent, event, gateway)
+            return reply
         if subcommand == "list":
             if len(argv) > 2 or (len(argv) == 2 and not self._is_all_option(argv[1])):
                 return f"[{agent}] usage: /{agent} list [--all]"
@@ -840,6 +957,7 @@ class CliBridgePlugin:
             if topic_event is not None:
                 reply_event = topic_event
                 topic_note = f"\ntopic: {topic_name}"
+                await self._set_telegram_agent_topic_icon_async(agent, reply_event, gateway)
             else:
                 topic_note = "\ntopic: unavailable; started in this chat"
 
@@ -896,6 +1014,87 @@ class CliBridgePlugin:
         if len(cleaned) > 120:
             cleaned = cleaned[:117].rstrip() + "..."
         return cleaned or agent
+
+    def _telegram_agent_topic_icon(self, agent: str) -> str | None:
+        key = f"HERMES_CLI_BRIDGE_TELEGRAM_{agent.upper()}_ICON"
+        configured = os.environ.get(key, "").strip()
+        if configured.lower() in {"0", "false", "no", "off", "none", "disabled"}:
+            return None
+        return configured or _TELEGRAM_AGENT_TOPIC_ICONS.get(agent)
+
+    def _telegram_agent_topic_icon_call(
+        self,
+        agent: str,
+        event: Any,
+        gateway: Any,
+    ) -> Any | None:
+        icon_custom_emoji_id = self._telegram_agent_topic_icon(agent)
+        if not icon_custom_emoji_id:
+            return None
+        source = getattr(event, "source", None)
+        if _platform_value(getattr(source, "platform", "")) != "telegram":
+            return None
+        if str(getattr(source, "chat_type", "") or "") != "dm":
+            return None
+        chat_id = str(getattr(source, "chat_id", "") or "")
+        thread_id = str(getattr(source, "thread_id", "") or "")
+        if not chat_id or not thread_id or thread_id == "1":
+            return None
+        adapter = self._adapter_for_source(gateway, source)
+        set_topic_icon = getattr(adapter, "set_dm_topic_icon", None)
+        if not callable(set_topic_icon):
+            logger.info(
+                "cli-bridge cannot set Telegram topic icon: "
+                "adapter has no set_dm_topic_icon chat=%s thread=%s agent=%s",
+                chat_id,
+                thread_id,
+                agent,
+            )
+            return None
+        try:
+            return set_topic_icon(chat_id, thread_id, icon_custom_emoji_id)
+        except Exception as exc:
+            logger.warning(
+                "cli-bridge failed setting Telegram topic icon: "
+                "chat=%s thread=%s agent=%s error=%s",
+                chat_id,
+                thread_id,
+                agent,
+                exc,
+            )
+            return None
+
+    def _set_telegram_agent_topic_icon(
+        self,
+        agent: str,
+        event: Any,
+        gateway: Any,
+    ) -> None:
+        result = self._telegram_agent_topic_icon_call(agent, event, gateway)
+        if inspect.isawaitable(result):
+            self._schedule_awaitable(gateway, result, label="topic icon")
+
+    async def _set_telegram_agent_topic_icon_async(
+        self,
+        agent: str,
+        event: Any,
+        gateway: Any,
+    ) -> None:
+        result = self._telegram_agent_topic_icon_call(agent, event, gateway)
+        if not inspect.isawaitable(result):
+            return
+        try:
+            await result
+        except Exception as exc:
+            source = getattr(event, "source", None)
+            logger.warning(
+                "cli-bridge failed setting Telegram topic icon: "
+                "chat=%s thread=%s agent=%s error=%s",
+                str(getattr(source, "chat_id", "") or ""),
+                str(getattr(source, "thread_id", "") or ""),
+                agent,
+                exc,
+            )
 
     def _normalize_bridge_name(self, name: str) -> str:
         normalized = name.strip()

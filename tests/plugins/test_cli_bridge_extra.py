@@ -216,6 +216,7 @@ def test_register_adds_hook_and_commands() -> None:
     register(ctx)
 
     assert "pre_gateway_dispatch" in manager._hooks
+    assert "rename" in manager._plugin_commands
     assert "codex" in manager._plugin_commands
     assert "claude" in manager._plugin_commands
 
@@ -392,12 +393,17 @@ def test_init_from_telegram_root_creates_topic_and_routes_session(
     fake_tmux = FakeTmux()
     sent: list[tuple[str, str | None]] = []
     topic_calls: list[tuple[str, str]] = []
+    icon_calls: list[tuple[str, str, str]] = []
 
     class Adapter:
         async def ensure_dm_topic(self, chat_id, topic_name, force_create=False):
             del force_create
             topic_calls.append((chat_id, topic_name))
             return "topic-api"
+
+        async def set_dm_topic_icon(self, chat_id, thread_id, icon_custom_emoji_id):
+            icon_calls.append((chat_id, thread_id, icon_custom_emoji_id))
+            return True
 
     plugin = CliBridgePlugin(
         tmux=fake_tmux,  # type: ignore[arg-type]
@@ -409,6 +415,7 @@ def test_init_from_telegram_root_creates_topic_and_routes_session(
     )
     plugin._ensure_agent_command_available = lambda *_args, **_kwargs: None  # type: ignore[method-assign]
     monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("HERMES_CLI_BRIDGE_TELEGRAM_CODEX_ICON", "codex-icon")
 
     result = plugin.handle_pre_gateway_dispatch(
         event=_event("/codex init api"),
@@ -421,6 +428,7 @@ def test_init_from_telegram_root_creates_topic_and_routes_session(
 
     assert result == {"action": "skip", "reason": "cli-bridge-control"}
     assert topic_calls == [("chat1", "codex: api")]
+    assert icon_calls == [("chat1", "topic-api", "codex-icon")]
     assert sent
     assert sent[-1][1] == "topic-api"
     assert sent[-1][0].startswith("[codex:api] started in")
@@ -444,6 +452,7 @@ def test_init_inside_existing_telegram_topic_does_not_create_topic(
     fake_tmux = FakeTmux()
     replies: list[str] = []
     topic_calls: list[tuple[str, str]] = []
+    icon_calls: list[tuple[str, str, str]] = []
 
     class Adapter:
         async def ensure_dm_topic(self, chat_id, topic_name, force_create=False):
@@ -451,8 +460,13 @@ def test_init_inside_existing_telegram_topic_does_not_create_topic(
             topic_calls.append((chat_id, topic_name))
             return "unused"
 
+        async def set_dm_topic_icon(self, chat_id, thread_id, icon_custom_emoji_id):
+            icon_calls.append((chat_id, thread_id, icon_custom_emoji_id))
+            return True
+
     plugin = _plugin(fake_tmux, replies, tmp_path)
     monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("HERMES_CLI_BRIDGE_TELEGRAM_CODEX_ICON", "codex-icon")
 
     result = plugin.handle_pre_gateway_dispatch(
         event=_event("/codex init api", thread_id="existing-topic"),
@@ -461,7 +475,58 @@ def test_init_inside_existing_telegram_topic_does_not_create_topic(
 
     assert result == {"action": "skip", "reason": "cli-bridge-control"}
     assert topic_calls == []
+    assert icon_calls == [("chat1", "existing-topic", "codex-icon")]
     assert replies[-1].startswith("[codex:api] started in")
+
+
+def test_rename_shortcut_renames_current_telegram_topic(tmp_path: Path) -> None:
+    fake_tmux = FakeTmux()
+    replies: list[str] = []
+    rename_calls: list[tuple[str, str, str]] = []
+
+    class Adapter:
+        async def rename_dm_topic(self, *, chat_id, thread_id, name):
+            rename_calls.append((chat_id, thread_id, name))
+            return True
+
+    plugin = _plugin(fake_tmux, replies, tmp_path)
+
+    result = plugin.handle_pre_gateway_dispatch(
+        event=_event("/rename Project Alpha", thread_id="topic-a"),
+        gateway=_gateway(adapters={Platform.TELEGRAM: Adapter()}),
+    )
+
+    assert result == {"action": "skip", "reason": "cli-bridge-topic-rename"}
+    assert rename_calls == [("chat1", "topic-a", "Project Alpha")]
+    assert replies == ["Renamed topic to Project Alpha."]
+
+
+def test_rename_shortcut_requires_topic_name(tmp_path: Path) -> None:
+    fake_tmux = FakeTmux()
+    replies: list[str] = []
+    plugin = _plugin(fake_tmux, replies, tmp_path)
+
+    result = plugin.handle_pre_gateway_dispatch(
+        event=_event("/rename", thread_id="topic-a"),
+        gateway=_gateway(),
+    )
+
+    assert result == {"action": "skip", "reason": "cli-bridge-topic-rename"}
+    assert replies == ["Usage: /rename <name>"]
+
+
+def test_rename_shortcut_requires_topic_thread(tmp_path: Path) -> None:
+    fake_tmux = FakeTmux()
+    replies: list[str] = []
+    plugin = _plugin(fake_tmux, replies, tmp_path)
+
+    result = plugin.handle_pre_gateway_dispatch(
+        event=_event("/rename Project Alpha"),
+        gateway=_gateway(),
+    )
+
+    assert result == {"action": "skip", "reason": "cli-bridge-topic-rename"}
+    assert replies == ["Run /rename inside the topic you want to rename."]
 
 
 def test_fresh_telegram_topic_requires_receiver_word(tmp_path: Path) -> None:
@@ -569,17 +634,26 @@ def test_fresh_telegram_topic_receiver_codex_starts_and_sends_prompt(
     fake_tmux = FakeTmux()
     replies: list[str] = []
     plugin = _plugin(fake_tmux, replies, tmp_path)
+    icon_calls: list[tuple[str, str, str]] = []
+
+    class Adapter:
+        async def set_dm_topic_icon(self, chat_id, thread_id, icon_custom_emoji_id):
+            icon_calls.append((chat_id, thread_id, icon_custom_emoji_id))
+            return True
+
     monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("HERMES_CLI_BRIDGE_TELEGRAM_CODEX_ICON", "codex-icon")
 
     result = plugin.handle_pre_gateway_dispatch(
         event=_event("codex fix the login bug", thread_id="new-topic"),
-        gateway=_gateway(),
+        gateway=_gateway(adapters={Platform.TELEGRAM: Adapter()}),
         session_store=_topic_session_store(has_session=False),
     )
 
     assert result == {"action": "skip", "reason": "cli-bridge-receiver"}
     session_name = str(fake_tmux.started[0]["session_name"])
     assert fake_tmux.inputs == [(session_name, "fix the login bug")]
+    assert icon_calls == [("chat1", "new-topic", "codex-icon")]
     assert replies[-1].startswith("[codex:default] started in")
     assert replies[-1].endswith("Prompt sent.")
 

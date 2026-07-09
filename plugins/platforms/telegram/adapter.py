@@ -2570,26 +2570,77 @@ class TelegramAdapter(BasePlatformAdapter):
 
     async def rename_dm_topic(
         self,
-        chat_id: int,
-        thread_id: int,
+        chat_id: int | str,
+        thread_id: int | str,
         name: str,
-    ) -> None:
+    ) -> bool:
         """Rename a forum topic in a private (DM) chat."""
         if not self._bot:
-            return
+            return False
+        topic_name = str(name or "").strip()
+        if not topic_name:
+            return False
+        if not thread_id or str(thread_id) == "1":
+            return False
         try:
-            chat_id_arg = int(chat_id)
+            chat_id_arg: int | str = int(chat_id)
+            thread_id_arg = int(thread_id)
         except (TypeError, ValueError):
-            chat_id_arg = chat_id
-        await self._bot.edit_forum_topic(
-            chat_id=chat_id_arg,
-            message_thread_id=int(thread_id),
-            name=name,
-        )
-        logger.info(
-            "[%s] Renamed DM topic in chat %s thread_id=%s -> '%s'",
-            self.name, chat_id, thread_id, name,
-        )
+            return False
+        try:
+            await self._bot.edit_forum_topic(
+                chat_id=chat_id_arg,
+                message_thread_id=thread_id_arg,
+                name=topic_name,
+            )
+            logger.info(
+                "[%s] Renamed DM topic in chat %s thread_id=%s -> '%s'",
+                self.name, chat_id_arg, thread_id_arg, topic_name,
+            )
+            return True
+        except Exception as exc:
+            logger.warning(
+                "[%s] Failed to rename DM topic in chat %s thread_id=%s: %s",
+                self.name, chat_id_arg, thread_id_arg, exc,
+            )
+            return False
+
+    async def set_dm_topic_icon(
+        self,
+        chat_id: str,
+        thread_id: str,
+        icon_custom_emoji_id: str,
+    ) -> bool:
+        """Set a private DM topic's custom emoji icon by thread id."""
+        if not self._bot:
+            return False
+        icon = str(icon_custom_emoji_id or "").strip()
+        if not icon:
+            return False
+        if not thread_id or str(thread_id) == "1":
+            return False
+        try:
+            chat_id_arg: int | str = int(chat_id)
+            thread_id_arg = int(thread_id)
+        except (TypeError, ValueError):
+            return False
+        try:
+            await self._bot.edit_forum_topic(
+                chat_id=chat_id_arg,
+                message_thread_id=thread_id_arg,
+                icon_custom_emoji_id=icon,
+            )
+            logger.info(
+                "[%s] Set DM topic icon in chat %s thread_id=%s -> %s",
+                self.name, chat_id_arg, thread_id_arg, icon,
+            )
+            return True
+        except Exception as exc:
+            logger.warning(
+                "[%s] Failed to set DM topic icon in chat %s thread_id=%s: %s",
+                self.name, chat_id_arg, thread_id_arg, exc,
+            )
+            return False
 
     async def delete_dm_topic(
         self,
